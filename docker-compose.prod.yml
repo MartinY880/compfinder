@@ -1,0 +1,52 @@
+services:
+  comp-finder:
+    build: .
+    container_name: comp-finder
+    restart: unless-stopped
+    expose:
+      - "8501"
+    environment:
+      # Snowflake
+      - SNOWFLAKE_ACCOUNT=${SNOWFLAKE_ACCOUNT}
+      - SNOWFLAKE_USER=${SNOWFLAKE_USER}
+      - SNOWFLAKE_WAREHOUSE=${SNOWFLAKE_WAREHOUSE}
+      - SNOWFLAKE_DATABASE=${SNOWFLAKE_DATABASE}
+      - SNOWFLAKE_SCHEMA=${SNOWFLAKE_SCHEMA}
+      - SNOWFLAKE_ROLE=${SNOWFLAKE_ROLE}
+      - SNOWFLAKE_PRIVATE_KEY_PATH=/app/certs/rsa_key.p8
+      # Google Maps
+      - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
+      # Logto OIDC
+      - LOGTO_ENDPOINT=${LOGTO_ENDPOINT}
+      - LOGTO_APP_ID=${LOGTO_APP_ID}
+      - LOGTO_APP_SECRET=${LOGTO_APP_SECRET}
+      - LOGTO_REDIRECT_URI=https://compfinder.mtgpros.com
+      - LOGTO_M2M_APP_ID=${LOGTO_M2M_APP_ID}
+      - LOGTO_M2M_APP_SECRET=${LOGTO_M2M_APP_SECRET}
+    volumes:
+      - comp-finder-certs:/app/certs:ro
+    networks:
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.compfinder.rule=Host(`compfinder.mtgpros.com`)"
+      - "traefik.http.routers.compfinder.entrypoints=websecure"
+      - "traefik.http.routers.compfinder.tls.certresolver=letsencrypt"
+      - "traefik.http.services.compfinder.loadbalancer.server.port=8501"
+      # WebSocket support for Streamlit
+      - "traefik.http.routers.compfinder.middlewares=compfinder-headers"
+      - "traefik.http.middlewares.compfinder-headers.headers.customrequestheaders.X-Forwarded-Proto=https"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  comp-finder-certs:
+    external: true
+
+networks:
+  traefik:
+    external: true
