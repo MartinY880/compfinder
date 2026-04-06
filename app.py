@@ -14,6 +14,7 @@ from datetime import date, timedelta
 from snowflake_client import find_subject_property, find_candidate_comps
 from comp_engine import score_and_rank
 from geo_utils import haversine_miles
+from auth import require_auth, get_user, logout
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
 
@@ -21,6 +22,10 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
 
 st.set_page_config(page_title="Comp Finder", page_icon="🏠", layout="wide")
 st.markdown('<style>input[type="number"]{color:#ffffff !important;} [data-testid="stSliderThumbValue"] p{color:#ffffff !important;} .st-emotion-cache-rnt0ih{background-color:#ffffff !important;}</style>', unsafe_allow_html=True)
+
+# ── Authentication ────────────────────────────────────────────────────────
+require_auth()
+
 st.title("🏠 Comp Finder")
 st.caption("Find near-identical comparable properties powered by MortgagePros")
 
@@ -29,6 +34,17 @@ st.caption("Find near-identical comparable properties powered by MortgagePros")
 PROPERTY_TYPES = ["SFR", "CONDO", "TOWNHOUSE", "MULTI_FAMILY", "MANUFACTURED", "MOBILE", "LAND", "AGRICULTURAL", "RENTAL_UNIT", "TIMESHARE"]
 
 with st.sidebar:
+    # ── User info + logout ────────────────────────────────────────────
+    _user = get_user()
+    if _user:
+        _name = _user.get("name") or _user.get("username") or _user.get("email", "User")
+        st.markdown(f"👤 **{_name}**")
+
+        if st.button("Sign Out", use_container_width=True):
+            logout()
+            st.rerun()
+        st.divider()
+
     st.header("Search Filters")
 
     # ── Distance & display ────────────────────────────────────────────────
