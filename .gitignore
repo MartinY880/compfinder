@@ -1,6 +1,10 @@
 .env
-.env.production
+.env.*
+!.env.example
 __pycache__/
 *.pyc
 .venv/
 certs/
+*.p8
+*.pem
+*.key

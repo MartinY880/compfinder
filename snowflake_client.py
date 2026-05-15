@@ -77,6 +77,7 @@ def find_subject_property(address: str, zipcode: str) -> pd.DataFrame:
         {col('bedrooms')}       AS bedrooms,
         {col('bathrooms')}      AS bathrooms,
         {col('sqft')}           AS sqft,
+        {col('above_grade_sqft')} AS above_grade_sqft,
         {col('lot_size')}       AS lot_size,
         {col('year_built')}     AS year_built,
         {col('property_type')}  AS property_type,
@@ -211,6 +212,7 @@ def find_candidate_comps(
             {col('bedrooms')}       AS bedrooms,
             {col('bathrooms')}      AS bathrooms,
             {col('sqft')}           AS sqft,
+            {col('above_grade_sqft')} AS above_grade_sqft,
             {col('lot_size')}       AS lot_size,
             {col('year_built')}     AS year_built,
             {col('property_type')}  AS property_type,
@@ -272,4 +274,79 @@ def find_candidate_comps(
 
     df = pd.read_sql(sql, conn, params=params)
     df.columns = df.columns.str.lower()
+    return df
+
+
+# ── Single Property Lookup (for manual comp entry) ────────────────────────
+
+@st.cache_data(ttl=3600)
+def find_property_by_address(
+    address: str,
+    zipcode: str,
+    subject_lat: float,
+    subject_lon: float,
+) -> pd.DataFrame:
+    """
+    Look up a single property by address + ZIP and compute its distance
+    from the subject. Returns a single-row DataFrame matching the comp
+    columns, or empty if not found.
+    """
+    conn = get_connection()
+    table = get_table("properties")
+    norm = normalize_address(address)
+
+    select_cols = f"""
+        {col('address')}        AS address,
+        {col('city')}           AS city,
+        {col('state')}          AS state,
+        {col('zipcode')}        AS zipcode,
+        {col('latitude')}       AS latitude,
+        {col('longitude')}      AS longitude,
+        {col('bedrooms')}       AS bedrooms,
+        {col('bathrooms')}      AS bathrooms,
+        {col('sqft')}           AS sqft,
+        {col('above_grade_sqft')} AS above_grade_sqft,
+        {col('lot_size')}       AS lot_size,
+        {col('year_built')}     AS year_built,
+        {col('property_type')}  AS property_type,
+        {col('stories')}        AS stories,
+        {col('basement_yn')}    AS basement_yn,
+        {col('pool_yn')}        AS pool_yn,
+        {col('garage')}         AS garage,
+        {col('association_yn')}  AS association_yn,
+        {col('association_name')} AS association_name,
+        {col('sale_date')}      AS sale_date,
+        {col('sale_price')}     AS sale_price,
+        3958.8 * 2 * ASIN(SQRT(
+            POWER(SIN(RADIANS({col('latitude')} - %(s_lat)s) / 2), 2) +
+            COS(RADIANS(%(s_lat)s)) * COS(RADIANS({col('latitude')})) *
+            POWER(SIN(RADIANS({col('longitude')} - %(s_lon)s) / 2), 2)
+        )) AS distance_miles
+    """
+
+    sql_exact = f"""
+    SELECT {select_cols}
+    FROM {table}
+    WHERE UPPER({col('address')}) = %(address)s
+      AND {col('zipcode')} = %(zipcode)s
+    LIMIT 1
+    """
+    params = {"address": norm, "zipcode": zipcode.strip(),
+              "s_lat": float(subject_lat), "s_lon": float(subject_lon)}
+    df = pd.read_sql(sql_exact, conn, params=params)
+    df.columns = df.columns.str.lower()
+
+    if df.empty:
+        fuzzy = norm.replace(" ", "%")
+        sql_fuzzy = f"""
+        SELECT {select_cols}
+        FROM {table}
+        WHERE UPPER({col('address')}) LIKE %(fuzzy)s
+          AND {col('zipcode')} = %(zipcode)s
+        LIMIT 1
+        """
+        params["fuzzy"] = f"%{fuzzy}%"
+        df = pd.read_sql(sql_fuzzy, conn, params=params)
+        df.columns = df.columns.str.lower()
+
     return df

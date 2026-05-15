@@ -36,6 +36,7 @@ COLUMNS = {
     "bedrooms": "BEDROOMS",
     "bathrooms": "BATHROOMS_TOTAL_PROJECTED",
     "sqft": "LIVING_AREA",
+    "above_grade_sqft": "LIVING_AREA_ABOVE_GRADE",
     "lot_size": "LOT_SIZE",
     "year_built": "YEAR_BUILT",
     "property_type": "PROPERTY_TYPE",

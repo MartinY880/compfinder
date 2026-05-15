@@ -70,6 +70,17 @@ def _tier_distance(distance_miles: float, search_radius: float) -> str:
     return YELLOW
 
 
+def _tier_city(subject_city, comp_city) -> str:
+    """Same city = Green, different city = Yellow."""
+    s = (subject_city or "").strip().upper()
+    c = (comp_city or "").strip().upper()
+    if not s or not c:
+        return GREEN  # can't compare, assume ok
+    if s == c:
+        return GREEN
+    return YELLOW
+
+
 def calculate_similarity(
     subject: dict,
     comp: dict,
@@ -92,6 +103,7 @@ def calculate_similarity(
                 "tier_sqft": RED,
                 "tier_year_built": RED,
                 "tier_distance": RED,
+                "tier_city": RED,
                 "match_tier": RED,
             }
 
@@ -114,6 +126,10 @@ def calculate_similarity(
 
     distance = comp.get("distance_miles", 0) or 0
     tier_dist = _tier_distance(distance, search_radius)
+
+    s_city = subject.get("city") or ""
+    c_city = comp.get("city") or ""
+    tier_city = _tier_city(s_city, c_city)
 
     # --- Score penalties (unchanged logic) ---
 
@@ -179,10 +195,14 @@ def calculate_similarity(
     else:
         score -= 15
 
+    # City penalty (weight: 5)
+    if tier_city == YELLOW:
+        score -= 5
+
     similarity = max(0.0, min(100.0, score))
 
     # --- Composite match tier ---
-    tiers = [tier_beds, tier_baths, tier_sqft, tier_year, tier_dist]
+    tiers = [tier_beds, tier_baths, tier_sqft, tier_year, tier_dist, tier_city]
     if similarity >= 80 and RED not in tiers:
         match_tier = GREEN
     elif similarity >= 50:
@@ -197,6 +217,7 @@ def calculate_similarity(
         "tier_sqft": tier_sqft,
         "tier_year_built": tier_year,
         "tier_distance": tier_dist,
+        "tier_city": tier_city,
         "match_tier": match_tier,
     }
 
@@ -227,6 +248,7 @@ def score_and_rank(
     comps_df["tier_sqft"] = [r["tier_sqft"] for r in results]
     comps_df["tier_year_built"] = [r["tier_year_built"] for r in results]
     comps_df["tier_distance"] = [r["tier_distance"] for r in results]
+    comps_df["tier_city"] = [r["tier_city"] for r in results]
     comps_df["match_tier"] = [r["match_tier"] for r in results]
 
     # Price per sqft

@@ -2,6 +2,7 @@
 OIDC Authentication via Logto
 =============================
 Handles OAuth2 Authorization Code flow for Streamlit using authlib.
+Persists auth in a browser cookie so refreshes don't require re-login.
 """
 
 import base64
@@ -12,13 +13,18 @@ import urllib.parse
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as _components
 
 LOGTO_ENDPOINT = os.getenv("LOGTO_ENDPOINT", "")
 LOGTO_APP_ID = os.getenv("LOGTO_APP_ID", "")
 LOGTO_APP_SECRET = os.getenv("LOGTO_APP_SECRET", "")
 LOGTO_REDIRECT_URI = os.getenv("LOGTO_REDIRECT_URI", "")
-LOGTO_M2M_APP_ID = os.getenv("LOGTO_M2M_APP_ID", "")
-LOGTO_M2M_APP_SECRET = os.getenv("LOGTO_M2M_APP_SECRET", "")
+LOGTO_API_RESOURCE = os.getenv("LOGTO_API_RESOURCE", "")
+
+# Cookie config
+_COOKIE_NAME = "compfinder_auth"
+_LOGOUT_FLAG_COOKIE = "compfinder_logged_out"
+_COOKIE_MAX_AGE = 60 * 60 * 8  # 8 hours
 
 # OIDC discovery endpoints (derived from Logto endpoint)
 _AUTHORIZE_URL = f"{LOGTO_ENDPOINT}/oidc/auth"
@@ -31,30 +37,89 @@ def is_configured() -> bool:
     return all([LOGTO_ENDPOINT, LOGTO_APP_ID, LOGTO_APP_SECRET, LOGTO_REDIRECT_URI])
 
 
+def _read_cookie() -> dict | None:
+    """Read auth cookie synchronously via st.context.cookies."""
+    try:
+        raw = st.context.cookies.get(_COOKIE_NAME)
+        if raw:
+            # Cookie value may be URL-encoded
+            try:
+                raw = urllib.parse.unquote(raw)
+            except Exception:
+                pass
+            return _json.loads(raw)
+    except Exception:
+        pass
+    return None
+
+
+def _set_cookie(data: dict):
+    """Set a cookie in the browser via a hidden JS snippet."""
+    encoded = urllib.parse.quote(_json.dumps(data))
+    js = (
+        f"<script>document.cookie='{_COOKIE_NAME}={encoded}"
+        f";path=/;max-age={_COOKIE_MAX_AGE};SameSite=Lax';</script>"
+    )
+    _components.html(js, height=0, width=0)
+
+
+def _delete_cookie():
+    """Delete the auth cookie via a hidden JS snippet."""
+    js = f"<script>document.cookie='{_COOKIE_NAME}=;path=/;max-age=0;SameSite=Lax';</script>"
+    _components.html(js, height=0, width=0)
+
+
+def _set_logout_flag_cookie():
+    """Set a short-lived cookie signalling that the user just logged out."""
+    js = (
+        f"<script>document.cookie='{_LOGOUT_FLAG_COOKIE}=1"
+        f";path=/;max-age=60;SameSite=Lax';</script>"
+    )
+    _components.html(js, height=0, width=0)
+
+
+def _redirect_top(url: str):
+    """Navigate the top browser window (not an iframe) to the given URL."""
+    # st.html renders directly in the parent document (no iframe sandbox),
+    # so window.location works without needing allow-top-navigation.
+    safe = _json.dumps(url)
+    try:
+        st.html(f"<script>window.location.href = {safe};</script>")
+    except Exception:
+        # Fallback for older Streamlit: meta refresh via link click
+        st.markdown(
+            f'<meta http-equiv="refresh" content="0;url={url}">'
+            f'<script>window.location.href = {safe};</script>',
+            unsafe_allow_html=True,
+        )
+
+
 def _get_login_url(state: str, nonce: str) -> str:
+    scope = "openid profile email roles manage:compfinder"
     params = {
         "client_id": LOGTO_APP_ID,
         "redirect_uri": LOGTO_REDIRECT_URI,
         "response_type": "code",
-        "scope": "openid profile email",
+        "scope": scope,
         "state": state,
         "nonce": nonce,
     }
+    if LOGTO_API_RESOURCE:
+        params["resource"] = LOGTO_API_RESOURCE
     return f"{_AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
 
 
 def _exchange_code(code: str) -> dict:
-    resp = requests.post(
-        _TOKEN_URL,
-        data={
-            "grant_type": "authorization_code",
-            "client_id": LOGTO_APP_ID,
-            "client_secret": LOGTO_APP_SECRET,
-            "redirect_uri": LOGTO_REDIRECT_URI,
-            "code": code,
-        },
-        timeout=10,
-    )
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": LOGTO_APP_ID,
+        "client_secret": LOGTO_APP_SECRET,
+        "redirect_uri": LOGTO_REDIRECT_URI,
+        "code": code,
+    }
+    if LOGTO_API_RESOURCE:
+        data["resource"] = LOGTO_API_RESOURCE
+    resp = requests.post(_TOKEN_URL, data=data, timeout=10)
     resp.raise_for_status()
     return resp.json()
 
@@ -77,50 +142,37 @@ def _get_userinfo(access_token: str) -> dict:
     return resp.json()
 
 
-_m2m_token_cache = {"token": None, "expires": 0}
-
-def _get_m2m_token() -> str:
-    """Get a cached Management API access token using M2M credentials."""
-    import time
-    if _m2m_token_cache["token"] and time.time() < _m2m_token_cache["expires"]:
-        return _m2m_token_cache["token"]
-    resp = requests.post(
-        _TOKEN_URL,
-        data={
-            "grant_type": "client_credentials",
-            "client_id": LOGTO_M2M_APP_ID,
-            "client_secret": LOGTO_M2M_APP_SECRET,
-            "resource": "https://default.logto.app/api",
-            "scope": "all",
-        },
-        timeout=10,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    _m2m_token_cache["token"] = data["access_token"]
-    _m2m_token_cache["expires"] = time.time() + data.get("expires_in", 3600) - 60
-    return data["access_token"]
-
-
-def _fetch_user_profile(user_id: str) -> dict:
-    """Fetch full user profile from Logto Management API."""
-    token = _get_m2m_token()
-    resp = requests.get(
-        f"{LOGTO_ENDPOINT}/api/users/{user_id}",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=5,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
 def require_auth():
     """Gate the app behind Logto login. Call at the top of the app."""
     if not is_configured():
         return  # Auth not configured, allow access
 
-    # Handle OAuth callback
     params = st.query_params
+    # Detect "just logged out" via either query flag OR short-lived cookie
+    # (Logto requires exact-match post-logout URI so we can't pass query params
+    # through it — a cookie survives the round-trip.)
+    just_logged_out = params.get("logged_out") == "1" or bool(
+        st.context.cookies.get(_LOGOUT_FLAG_COOKIE)
+    )
+
+    # If we just logged out, wipe both cookies and skip restore
+    if just_logged_out:
+        _delete_cookie()
+        # Clear the logged-out flag cookie too
+        _components.html(
+            f"<script>document.cookie='{_LOGOUT_FLAG_COOKIE}=;path=/;max-age=0;SameSite=Lax';</script>",
+            height=0, width=0,
+        )
+        st.session_state.pop("_auth_user", None)
+        st.session_state.pop("_auth_token", None)
+    # Restore session from cookie if session_state is empty
+    elif "_auth_user" not in st.session_state:
+        cookie_data = _read_cookie()
+        if cookie_data and "user" in cookie_data:
+            st.session_state["_auth_user"] = cookie_data["user"]
+            st.session_state["_auth_token"] = cookie_data.get("token", {})
+
+    # Handle OAuth callback
     code = params.get("code")
     state = params.get("state")
     error = params.get("error")
@@ -146,23 +198,16 @@ def require_auth():
             st.stop()
 
         try:
-            userinfo = _get_userinfo(tokens["access_token"])
-            # Enrich with Management API data (has name/email)
-            if LOGTO_M2M_APP_ID and LOGTO_M2M_APP_SECRET and userinfo.get("sub"):
-                try:
-                    profile = _fetch_user_profile(userinfo["sub"])
-                    userinfo["name"] = profile.get("name") or ""
-                    userinfo["email"] = profile.get("primaryEmail") or ""
-                except Exception:
-                    pass
-            # Merge ID token claims (has name/email even with openid-only scope)
+            # With an API resource, the access token is a JWT scoped to that
+            # resource — the /oidc/me userinfo endpoint won't accept it.
+            # Use ID token claims for user info instead.
+            userinfo = {}
             if tokens.get("id_token"):
-                id_claims = _decode_id_token(tokens["id_token"])
-                for key in ("name", "email", "username", "picture"):
-                    if key in id_claims and key not in userinfo:
-                        userinfo[key] = id_claims[key]
+                userinfo = _decode_id_token(tokens["id_token"])
             st.session_state["_auth_user"] = userinfo
             st.session_state["_auth_token"] = tokens
+            # Persist to cookie so refreshes don't require re-login
+            _set_cookie({"user": userinfo, "token": {"access_token": tokens.get("access_token", ""), "id_token": tokens.get("id_token", ""), "scope": tokens.get("scope", "")}})
             # Clear query params
             st.query_params.clear()
             st.rerun()
@@ -182,6 +227,13 @@ def require_auth():
     nonce = secrets.token_urlsafe(16)
     st.session_state["_oauth_state"] = state
     login_url = _get_login_url(state, nonce)
+
+    # Auto-redirect to Logto. If Logto has an active session, it will
+    # silently bounce back with a code; otherwise it will show Logto's
+    # own login UI. Skip auto-redirect if user just logged out (detected
+    # via query flag or short-lived cookie set just before logout).
+    if not just_logged_out:
+        _redirect_top(login_url)
 
     # Hide sidebar and default Streamlit elements on login page
     st.markdown(
@@ -222,7 +274,12 @@ def require_auth():
         """,
         unsafe_allow_html=True,
     )
-    st.link_button("🔐 Sign in with Microsoft", login_url, use_container_width=True)
+    st.markdown(
+        f'<a href="{login_url}" target="_self" style="display:block;background:#2563eb;color:#fff;'
+        f'padding:12px 20px;border-radius:8px;text-align:center;text-decoration:none;font-weight:600;'
+        f'font-size:14px;transition:background .15s;">🔐 Sign in with Microsoft</a>',
+        unsafe_allow_html=True,
+    )
     st.markdown('<p class="login-footer">Authorized employees only</p>', unsafe_allow_html=True)
     st.stop()
 
@@ -231,11 +288,63 @@ def get_user() -> dict | None:
     return st.session_state.get("_auth_user")
 
 
+def has_role(role_name: str) -> bool:
+    """Return True if the logged-in user has the given Logto role name."""
+    user = get_user()
+    if not user:
+        return False
+    roles = user.get("roles", [])
+    # Logto returns roles as a list of strings or dicts with a 'name' key
+    for r in roles:
+        if isinstance(r, str) and r == role_name:
+            return True
+        if isinstance(r, dict) and r.get("name") == role_name:
+            return True
+    return False
+
+
+def has_scope(scope_name: str) -> bool:
+    """Return True if the access token JWT contains the given scope claim."""
+    token = st.session_state.get("_auth_token", {})
+    access_token = token.get("access_token", "")
+    if not access_token:
+        return False
+    try:
+        claims = _decode_id_token(access_token)
+        return scope_name in claims.get("scope", "").split()
+    except Exception:
+        return False
+
+
 def logout():
-    """Clear session and redirect to Logto end-session."""
+    """Clear local session + cookie, end Logto session, return with logged_out flag."""
+    id_token = st.session_state.get("_auth_token", {}).get("id_token", "")
+    _delete_cookie()
     st.session_state.pop("_auth_user", None)
     st.session_state.pop("_auth_token", None)
     st.session_state.pop("_oauth_state", None)
     # Also clear cached search results
     st.session_state.pop("_results_subject", None)
     st.session_state.pop("_results_comps", None)
+
+    # Build Logto end-session URL. post_logout_redirect_uri brings the user
+    # back here with ?logged_out=1 so we don't auto-redirect to login.
+    post_logout = f"{LOGTO_REDIRECT_URI}?logged_out=1"
+    params = {"post_logout_redirect_uri": post_logout}
+    if id_token:
+        params["id_token_hint"] = id_token
+    end_session_url = f"{_END_SESSION_URL}?{urllib.parse.urlencode(params)}"
+    _redirect_top(end_session_url)
+    st.stop()
+
+
+def get_logout_url() -> str:
+    """Return the Logto end-session URL for direct linking from the UI.
+    The compfinder_logged_out cookie (set by the sign-out JS in app.py) is used
+    to detect the post-logout redirect — no query param needed on the URI.
+    """
+    id_token = st.session_state.get("_auth_token", {}).get("id_token", "")
+    params = {"post_logout_redirect_uri": LOGTO_REDIRECT_URI}
+    if id_token:
+        params["id_token_hint"] = id_token
+    return f"{_END_SESSION_URL}?{urllib.parse.urlencode(params)}"

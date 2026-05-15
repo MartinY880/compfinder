@@ -1,10 +1,28 @@
+version: '3.8'
 services:
+  db:
+    image: postgres:16-alpine
+    container_name: comp-finder-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=compfinder
+      - POSTGRES_USER=compfinder
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - comp-finder-pgdata:/var/lib/postgresql/data
+    networks:
+      - comp-finder
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
   comp-finder:
-    build: .
+    image: crystal02202/compfinder:v1.5
     container_name: comp-finder
     restart: unless-stopped
-    expose:
-      - "8501"
+    depends_on:
+      - db
     environment:
       # Snowflake
       - SNOWFLAKE_ACCOUNT=${SNOWFLAKE_ACCOUNT}
@@ -23,19 +41,40 @@ services:
       - LOGTO_REDIRECT_URI=https://compfinder.mtgpros.com
       - LOGTO_M2M_APP_ID=${LOGTO_M2M_APP_ID}
       - LOGTO_M2M_APP_SECRET=${LOGTO_M2M_APP_SECRET}
+      - LOGTO_API_RESOURCE=${LOGTO_API_RESOURCE}
+      # Claude
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # Database
+      - DATABASE_URL=postgresql://compfinder:${POSTGRES_PASSWORD}@db:5432/compfinder
     volumes:
       - comp-finder-certs:/app/certs:ro
     networks:
-      - traefik
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.compfinder.rule=Host(`compfinder.mtgpros.com`)"
-      - "traefik.http.routers.compfinder.entrypoints=websecure"
-      - "traefik.http.routers.compfinder.tls.certresolver=letsencrypt"
-      - "traefik.http.services.compfinder.loadbalancer.server.port=8501"
-      # WebSocket support for Streamlit
-      - "traefik.http.routers.compfinder.middlewares=compfinder-headers"
-      - "traefik.http.middlewares.compfinder-headers.headers.customrequestheaders.X-Forwarded-Proto=https"
+      - traefik_traefik-swarm
+      - comp-finder
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1
+        delay: 30s
+        monitor: 30s
+        order: start-first
+      restart_policy:
+        condition: on-failure
+      labels:
+        - traefik.enable=true
+        - traefik.swarm.network=traefik_traefik-swarm
+        - traefik.http.routers.compfinder.rule=Host(`compfinder.mtgpros.com`)
+        - traefik.http.routers.compfinder.entrypoints=websecure
+        - traefik.http.routers.compfinder.tls.certresolver=letsencrypt
+        - traefik.http.services.compfinder.loadbalancer.server.port=8501
+        - traefik.http.services.compfinder.loadbalancer.sticky.cookie=true
+        - traefik.http.services.compfinder.loadbalancer.sticky.cookie.name=compfinder
+        - traefik.http.services.compfinder.loadbalancer.sticky.cookie.secure=true
+        - traefik.http.services.compfinder.loadbalancer.sticky.cookie.httpOnly=true
+        - traefik.http.services.compfinder.loadbalancer.healthcheck.path=/_stcore/health
+        - traefik.http.services.compfinder.loadbalancer.healthcheck.interval=5s
+        - traefik.http.services.compfinder.loadbalancer.healthcheck.timeout=3s
+        - traefik.public=true
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
       interval: 30s
@@ -45,8 +84,13 @@ services:
 
 volumes:
   comp-finder-certs:
-    external: true
+    driver: local
+  comp-finder-pgdata:
+    driver: local
 
 networks:
-  traefik:
+  comp-finder:
+    driver: overlay
+    attachable: true
+  traefik_traefik-swarm:
     external: true
