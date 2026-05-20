@@ -285,6 +285,21 @@ Write at a 6/10 level of formality — professional but not technical.
 - Does not call external tools
 - Does not summarize or explain its output
 
+## Critical extraction rule
+
+If you cannot find a concept with confidence, the field is "". 
+
+A blank field tells the reviewer "this appraisal didn't address that 
+topic" — which is useful information. A fabricated field tells the 
+reviewer something false, which causes a compliance issue.
+
+When in doubt, blank it. The reviewer can fill in gaps. The reviewer 
+cannot easily detect a confident-sounding lie.
+
+You are NOT scored on extraction completeness. You ARE scored on 
+extraction accuracy.
+
+
 ## Final check before responding
 
 Before returning, verify:

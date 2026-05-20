@@ -152,6 +152,9 @@ with st.sidebar:
     filter_garage = st.selectbox("Garage", ["Any", "Yes", "No"])
     filter_hoa = st.selectbox("HOA", ["Any", "Yes", "No"])
 
+    # Placeholder for reload button (rendered after fingerprint check)
+    _reload_placeholder = st.empty()
+
 # Collect all filters into a dict for the query
 advanced_filters = {
     "prop_types": filter_prop_type if filter_prop_type else None,
@@ -174,6 +177,23 @@ advanced_filters = {
     "garage": filter_garage,
     "hoa": filter_hoa,
 }
+
+# ── Filter change detection: show reload button when filters change ────────
+_filter_fingerprint = (
+    max_radius, min_similarity, max_comps,
+    months_back, str(sale_start_date), str(sale_end_date),
+    tuple(sorted((advanced_filters or {}).items())),
+)
+_prev_fingerprint = st.session_state.get("_filter_fingerprint")
+_filters_changed = (
+    _prev_fingerprint is not None
+    and _prev_fingerprint != _filter_fingerprint
+    and "_results_subject" in st.session_state
+)
+_reload_clicked = False
+if _filters_changed:
+    with _reload_placeholder:
+        _reload_clicked = st.button("🔄 Reload with new filters", type="primary", use_container_width=True)
 
 # ── Google Places helpers ─────────────────────────────────────────────────
 
@@ -312,34 +332,40 @@ if st.session_state.get("_dup_pending") and not st.session_state.get("_dup_confi
 
 # ── Main logic ────────────────────────────────────────────────────────────
 
-if search_clicked or st.session_state.get("_dup_confirmed"):
+if search_clicked or st.session_state.get("_dup_confirmed") or _reload_clicked:
+    # For filter-change re-runs, use the stored address from the last search
+    if _reload_clicked and not search_clicked:
+        street_address = st.session_state.get("_last_search_street", street_address)
+        zip_code = st.session_state.get("_last_search_zip", zip_code)
+
     if not street_address or not zip_code:
         st.warning("Please enter both a street address and ZIP code.")
         st.stop()
 
-    # ── Check for recent ROV generation ────────────────────────────────
-    _search_addr = street_address
-    try:
-        _recent = find_recent_search(_search_addr, days=7)
-    except Exception:
-        _recent = None  # don't block on DB issues
+    # ── Check for recent ROV generation (skip on filter-only changes) ──
+    if not _reload_clicked:
+        _search_addr = street_address
+        try:
+            _recent = find_recent_search(_search_addr, days=7)
+        except Exception:
+            _recent = None  # don't block on DB issues
 
-    if _recent and not st.session_state.get("_dup_confirmed"):
-        _when = _recent["created_at"].strftime("%b %d, %Y at %I:%M %p")
-        _who = _recent.get("user_email", "someone")
-        st.session_state["_dup_pending"] = True
-        st.session_state["_dup_info"] = {
-            "when": _when,
-            "who": _who,
-            "count": _recent.get("comps_count", 0),
-            "agent_json": _recent.get("agent_json"),
-            "address": _recent.get("subject_address", "property"),
-        }
-        st.rerun()
-    else:
-        st.session_state.pop("_dup_confirmed", None)
-        st.session_state.pop("_dup_pending", None)
-        st.session_state.pop("_dup_info", None)
+        if _recent and not st.session_state.get("_dup_confirmed"):
+            _when = _recent["created_at"].strftime("%b %d, %Y at %I:%M %p")
+            _who = _recent.get("user_email", "someone")
+            st.session_state["_dup_pending"] = True
+            st.session_state["_dup_info"] = {
+                "when": _when,
+                "who": _who,
+                "count": _recent.get("comps_count", 0),
+                "agent_json": _recent.get("agent_json"),
+                "address": _recent.get("subject_address", "property"),
+            }
+            st.rerun()
+        else:
+            st.session_state.pop("_dup_confirmed", None)
+            st.session_state.pop("_dup_pending", None)
+            st.session_state.pop("_dup_info", None)
 
     # ── Look up subject property ──────────────────────────────────────────
     with st.spinner("Looking up subject property…"):
@@ -396,18 +422,24 @@ if search_clicked or st.session_state.get("_dup_confirmed"):
     # Cache results in session state
     st.session_state["_results_subject"] = subject
     st.session_state["_results_comps"] = comps
+    st.session_state["_filter_fingerprint"] = _filter_fingerprint
+    st.session_state["_last_search_street"] = street_address
+    st.session_state["_last_search_zip"] = zip_code
+    # Clear manual comps on new search/filter change
+    st.session_state["_manual_comps"] = []
 
-    # Log the search
-    try:
-        _user = get_user()
-        log_comp_search(
-            user_email=(_user or {}).get("email", "unknown"),
-            subject_address=f"{street_address}, {zip_code}",
-            filters=advanced_filters,
-            result_count=len(comps),
-        )
-    except Exception:
-        pass  # never block the UI for logging failures
+    # Log the search (only on explicit searches, not filter reloads)
+    if not _reload_clicked:
+        try:
+            _user = get_user()
+            log_comp_search(
+                user_email=(_user or {}).get("email", "unknown"),
+                subject_address=f"{street_address}, {zip_code}",
+                filters=advanced_filters,
+                result_count=len(comps),
+            )
+        except Exception:
+            pass  # never block the UI for logging failures
 
 # ── Display results (from session state) ──────────────────────────────────
 
@@ -441,39 +473,76 @@ st.caption("Look up a property not in the search results and add it to the comps
 if "_manual_comps" not in st.session_state:
     st.session_state["_manual_comps"] = []
 
-_mc1, _mc2, _mc3 = st.columns([3, 2, 1])
-with _mc1:
-    _manual_addr = st.text_input("Address", placeholder="e.g. 456 Oak Ave", key="_manual_comp_addr")
-with _mc2:
-    _manual_zip = st.text_input("ZIP Code", placeholder="e.g. 36093", key="_manual_comp_zip")
-with _mc3:
-    st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-    _add_comp = st.button("🔍 Look Up", key="_add_manual_comp", use_container_width=True)
+# Google Places autocomplete for manual comp lookup (same UX as main search)
+if use_autocomplete:
+    _mc_query = st.text_input("Start typing an address…", key="_mc_addr_query", placeholder="e.g. 456 Oak Ave, Springfield", on_change=lambda: None)
+    # Prevent enter from triggering — only process when a dropdown selection is made
+    _mc_suggestions = google_autocomplete(_mc_query) if _mc_query and len(_mc_query) >= 3 else []
 
-if _add_comp and _manual_addr.strip() and _manual_zip.strip():
-    with st.spinner("Looking up property…"):
-        _found = find_property_by_address(
-            _manual_addr.strip(),
-            _manual_zip.strip(),
-            float(subject["latitude"]),
-            float(subject["longitude"]),
-        )
-    if _found.empty:
-        st.warning(f"Property not found: {_manual_addr.strip()}, {_manual_zip.strip()}")
-    else:
-        _row = _found.iloc[0]
-        _dup = any(
-            _mc.get("address", "").upper() == str(_row.get("address", "")).upper()
-            for _mc in st.session_state["_manual_comps"]
-        )
-        # Also check against existing comps
-        if not _dup and str(_row.get("address", "")).upper() in comps["address"].str.upper().values:
-            _dup = True
-        if _dup:
-            st.info("This property is already in the results.")
+    _mc_matched = None
+    if _mc_suggestions:
+        _mc_options = ["Select Address From List"] + [s["description"] for s in _mc_suggestions]
+        _mc_choice = st.selectbox("Select address", _mc_options, key="_mc_addr_select", label_visibility="collapsed")
+        if _mc_choice != "Select Address From List":
+            _mc_matched = next((s for s in _mc_suggestions if s["description"] == _mc_choice), None)
+
+    if _mc_matched:
+        _mc_details = google_place_details(_mc_matched["place_id"])
+        if _mc_details["street"] and _mc_details["zipcode"]:
+            _manual_addr = _mc_details["street"]
+            _manual_zip = _mc_details["zipcode"]
+            # Check if already added (silently skip — no message needed after rerun)
+            _already_manual = any(
+                _mc.get("address", "").upper() == _manual_addr.upper()
+                for _mc in st.session_state["_manual_comps"]
+            )
+            _already_in_comps = _manual_addr.upper() in comps["address"].str.upper().values
+            if not _already_manual and not _already_in_comps:
+                with st.spinner("Looking up property…"):
+                    _found = find_property_by_address(
+                        _manual_addr.strip(),
+                        _manual_zip.strip(),
+                        float(subject["latitude"]),
+                        float(subject["longitude"]),
+                    )
+                if _found.empty:
+                    st.warning(f"Property not found: {_manual_addr}, {_manual_zip}")
+                else:
+                    st.session_state["_manual_comps"].append(_found.iloc[0].to_dict())
+                    st.rerun()
+else:
+    _mc1, _mc2, _mc3 = st.columns([3, 2, 1])
+    with _mc1:
+        _manual_addr = st.text_input("Address", placeholder="e.g. 456 Oak Ave", key="_manual_comp_addr")
+    with _mc2:
+        _manual_zip = st.text_input("ZIP Code", placeholder="e.g. 36093", key="_manual_comp_zip")
+    with _mc3:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        _add_comp = st.button("🔍 Look Up", key="_add_manual_comp", use_container_width=True)
+
+    if _add_comp and _manual_addr.strip() and _manual_zip.strip():
+        with st.spinner("Looking up property…"):
+            _found = find_property_by_address(
+                _manual_addr.strip(),
+                _manual_zip.strip(),
+                float(subject["latitude"]),
+                float(subject["longitude"]),
+            )
+        if _found.empty:
+            st.warning(f"Property not found: {_manual_addr.strip()}, {_manual_zip.strip()}")
         else:
-            st.session_state["_manual_comps"].append(_row.to_dict())
-            st.rerun()
+            _row = _found.iloc[0]
+            _dup = any(
+                _mc.get("address", "").upper() == str(_row.get("address", "")).upper()
+                for _mc in st.session_state["_manual_comps"]
+            )
+            if not _dup and str(_row.get("address", "")).upper() in comps["address"].str.upper().values:
+                _dup = True
+            if _dup:
+                st.info("This property is already in the results.")
+            else:
+                st.session_state["_manual_comps"].append(_row.to_dict())
+                st.rerun()
 
 # Merge manual comps into the main comps dataframe
 if st.session_state.get("_manual_comps"):
@@ -493,16 +562,10 @@ if st.session_state.get("_manual_comps"):
                 _manual_df[_needed_col] = ""
     comps = pd.concat([comps, _manual_df], ignore_index=True)
 
-    # Show remove buttons for manual comps
+    # Show added comps
     for _mi, _mc in enumerate(st.session_state["_manual_comps"]):
-        _col_info, _col_rm = st.columns([5, 1])
-        with _col_info:
-            _mc_price = f"${_mc.get('sale_price', 0):,.0f}" if _mc.get("sale_price") else "N/A"
-            st.caption(f"✓ Added: **{_mc.get('address', 'N/A')}**, {_mc.get('city', '')} — {_mc_price}")
-        with _col_rm:
-            if st.button("✕ Remove", key=f"_rm_mc_{_mi}"):
-                st.session_state["_manual_comps"].pop(_mi)
-                st.rerun()
+        _mc_price = f"${_mc.get('sale_price', 0):,.0f}" if _mc.get("sale_price") else "N/A"
+        st.caption(f"✓ Added: **{_mc.get('address', 'N/A')}**, {_mc.get('city', '')} — {_mc_price}")
 
 st.divider()
 
@@ -570,6 +633,7 @@ for _, r in comps.iterrows():
 
 _rows_json = _json.dumps(_rows)
 _headers_json = _json.dumps(["Photo"] + [_col_labels.get(c, c) for c in display_cols])
+_num_manual = len(st.session_state.get("_manual_comps", []))
 
 _table_html = (
     '<style>'
@@ -604,6 +668,7 @@ _table_html = (
     '<script>'
     'const rows=' + _rows_json + ';'
     'const hdrs=' + _headers_json + ';'
+    'const numManual=' + str(_num_manual) + ';'
     'const tierBg={"Green":"#166534","Yellow":"#a16207","Red":"#991b1b"};'
     'let showSelOnly=false;'
     'const hdr=document.getElementById("hdr");'
@@ -630,8 +695,17 @@ _table_html = (
     '  r.cells.forEach(v=>{const td=document.createElement("td");td.textContent=v;tr.appendChild(td);});'
     '  tbody.appendChild(tr);'
     '  allTrs.push(tr);'
-    '});'
-    'function updateCount(){document.getElementById("selCnt").textContent=document.querySelectorAll(".sel-chk:checked").length;}'
+    '});\n'
+    'if(numManual>0){\n'
+    '  var startIdx=rows.length-numManual;\n'
+    '  for(var i=startIdx;i<rows.length;i++){\n'
+    '    var chk=allTrs[i].querySelector(".sel-chk");\n'
+    '    if(chk&&!chk.checked){chk.checked=true;allTrs[i].classList.add("selected");}\n'
+    '  }\n'
+    '  allTrs[startIdx].scrollIntoView({behavior:"smooth",block:"center"});\n'
+    '}\n'
+    'function updateCount(){document.getElementById("selCnt").textContent=document.querySelectorAll(".sel-chk:checked").length;}\n'
+    'updateCount();\n'
     'function applyFilter(){'
     '  if(!showSelOnly){allTrs.forEach(t=>t.classList.remove("hide-unselected"));return;}'
     '  allTrs.forEach(t=>{'
@@ -750,6 +824,27 @@ _html = (
     '        tooltip.style.left = (info.x + 12) + "px";'
     '        tooltip.style.top = (info.y + 12) + "px";'
     '      } else { tooltip.style.display = "none"; }'
+    '    },'
+    '    onClick: (info) => {'
+    '      if (info.layer && info.layer.id === "comps" && info.object) {'
+    '        const idx = info.index;'
+    '        try {'
+    '          const iframes = window.parent.document.querySelectorAll("iframe");'
+    '          for (const iframe of iframes) {'
+    '            try {'
+    '              const chks = iframe.contentDocument.querySelectorAll(".sel-chk");'
+    '              if (chks.length > 0 && idx < chks.length) {'
+    '                if (!chks[idx].checked) { chks[idx].checked = true; chks[idx].dispatchEvent(new Event("change")); }'
+    '                const row = chks[idx].closest("tr");'
+    '                if (row) { row.classList.add("selected"); row.scrollIntoView({behavior:"smooth",block:"center"}); }'
+    '                const cnt = iframe.contentDocument.getElementById("selCnt");'
+    '                if (cnt) cnt.textContent = iframe.contentDocument.querySelectorAll(".sel-chk:checked").length;'
+    '                break;'
+    '              }'
+    '            } catch(e) {}'
+    '          }'
+    '        } catch(e) {}'
+    '      }'
     '    }'
     '  });'
     '}'
