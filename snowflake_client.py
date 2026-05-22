@@ -68,6 +68,7 @@ def find_subject_property(address: str, zipcode: str) -> pd.DataFrame:
     norm = normalize_address(address)
 
     select_cols = f"""
+        Assessment_APN          AS apn,
         {col('address')}        AS address,
         {col('city')}           AS city,
         {col('state')}          AS state,
@@ -203,6 +204,7 @@ def find_candidate_comps(
     sql = f"""
     WITH candidates AS (
         SELECT
+            Assessment_APN          AS apn,
             {col('address')}        AS address,
             {col('city')}           AS city,
             {col('state')}          AS state,
@@ -296,6 +298,7 @@ def find_property_by_address(
     norm = normalize_address(address)
 
     select_cols = f"""
+        Assessment_APN          AS apn,
         {col('address')}        AS address,
         {col('city')}           AS city,
         {col('state')}          AS state,

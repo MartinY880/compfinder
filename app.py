@@ -15,10 +15,12 @@ from snowflake_client import find_subject_property, find_candidate_comps, find_p
 from comp_engine import score_and_rank
 from geo_utils import haversine_miles
 from auth import require_auth, get_user, logout, get_logout_url
+import comp_enrichment
+import propertyradar_client
 from auth import _delete_cookie as _auth_delete_cookie
 from auth import _set_logout_flag_cookie, _redirect_top, has_scope, has_role
 from generate_rov import generate_rov_pdf
-from db import init_db, log_comp_search, log_rov_report, find_recent_search
+from db import init_db, log_comp_search, log_rov_report, log_rov_revision, find_recent_search, update_enrichment_stats
 
 init_db()
 
@@ -419,6 +421,10 @@ if search_clicked or st.session_state.get("_dup_confirmed") or _reload_clicked:
         )
         st.stop()
 
+    # ── PropertyRadar enrichment ──────────────────────────────────────────
+    _pr_apns_queried = int(comps["apn"].notna().sum()) if "apn" in comps.columns else 0
+    comps, _pr_apns_returned, _pr_debug_log = comp_enrichment.merge_pr_enrichment(comps)
+
     # Cache results in session state
     st.session_state["_results_subject"] = subject
     st.session_state["_results_comps"] = comps
@@ -427,17 +433,26 @@ if search_clicked or st.session_state.get("_dup_confirmed") or _reload_clicked:
     st.session_state["_last_search_zip"] = zip_code
     # Clear manual comps on new search/filter change
     st.session_state["_manual_comps"] = []
+    st.session_state["_manual_comps_synced"] = 0
+    st.session_state["_manual_comps_enriched"] = []
 
     # Log the search (only on explicit searches, not filter reloads)
     if not _reload_clicked:
         try:
             _user = get_user()
-            log_comp_search(
+            _enrichment_summary = comp_enrichment.enrichment_summary(
+                comps, _pr_apns_queried, _pr_apns_returned, _pr_debug_log
+            )
+            _search_id = log_comp_search(
                 user_email=(_user or {}).get("email", "unknown"),
                 subject_address=f"{street_address}, {zip_code}",
                 filters=advanced_filters,
                 result_count=len(comps),
+                enrichment_summary=_enrichment_summary,
             )
+            if _search_id:
+                st.session_state["_last_search_id"] = _search_id
+                st.session_state["_last_enrichment"] = _enrichment_summary
         except Exception:
             pass  # never block the UI for logging failures
 
@@ -546,21 +561,54 @@ else:
 
 # Merge manual comps into the main comps dataframe
 if st.session_state.get("_manual_comps"):
-    _manual_df = pd.DataFrame(st.session_state["_manual_comps"])
-    for _needed_col in ["price_per_sqft", "similarity", "match_tier", "apn_mls", "data_source"]:
-        if _needed_col not in _manual_df.columns:
-            if _needed_col == "price_per_sqft":
-                _manual_df[_needed_col] = _manual_df.apply(
-                    lambda r: r["sale_price"] / r["sqft"] if pd.notna(r.get("sale_price")) and pd.notna(r.get("sqft")) and r.get("sqft", 0) > 0 else 0, axis=1)
-            elif _needed_col == "similarity":
-                _manual_df[_needed_col] = 0
-            elif _needed_col == "match_tier":
-                _manual_df[_needed_col] = "Manual"
-            elif _needed_col == "data_source":
-                _manual_df[_needed_col] = "Manual"
-            else:
-                _manual_df[_needed_col] = ""
-    comps = pd.concat([comps, _manual_df], ignore_index=True)
+    _manual_count = len(st.session_state["_manual_comps"])
+    _synced_count = st.session_state.get("_manual_comps_synced", 0)
+
+    # Only call PR API for NEW manual comps (not on every rerun)
+    if _manual_count > _synced_count:
+        # Enrich only the newly added comps
+        _new_comps = st.session_state["_manual_comps"][_synced_count:]
+        _new_df = pd.DataFrame(_new_comps)
+        for _needed_col in ["price_per_sqft", "similarity", "match_tier", "apn_mls", "data_source"]:
+            if _needed_col not in _new_df.columns:
+                if _needed_col == "price_per_sqft":
+                    _new_df[_needed_col] = _new_df.apply(
+                        lambda r: r["sale_price"] / r["sqft"] if pd.notna(r.get("sale_price")) and pd.notna(r.get("sqft")) and r.get("sqft", 0) > 0 else 0, axis=1)
+                elif _needed_col == "similarity":
+                    _new_df[_needed_col] = 0
+                elif _needed_col == "match_tier":
+                    _new_df[_needed_col] = "Manual"
+                elif _needed_col == "data_source":
+                    _new_df[_needed_col] = "Manual"
+                else:
+                    _new_df[_needed_col] = ""
+        _manual_apns_queried = int(_new_df["apn"].notna().sum()) if "apn" in _new_df.columns else 0
+        _new_df, _manual_pr_returned, _manual_debug_log = comp_enrichment.merge_pr_enrichment(_new_df)
+
+        # Cache enriched results in session state
+        _cached = st.session_state.setdefault("_manual_comps_enriched", [])
+        _cached.extend(_new_df.to_dict(orient="records"))
+        st.session_state["_manual_comps_synced"] = _manual_count
+
+        # Update DB record
+        _last_sid = st.session_state.get("_last_search_id")
+        _last_enr = st.session_state.get("_last_enrichment")
+        if _last_sid and _last_enr:
+            try:
+                _last_enr["total_comps"] = _last_enr.get("total_comps", 0) + len(_new_df)
+                _last_enr["pr_apns_queried"] = _last_enr.get("pr_apns_queried", 0) + _manual_apns_queried
+                _last_enr["pr_apns_returned"] = _last_enr.get("pr_apns_returned", 0) + _manual_pr_returned
+                _last_enr["pr_enriched_count"] = _last_enr.get("pr_enriched_count", 0) + int(_new_df["pr_enriched"].sum()) if "pr_enriched" in _new_df.columns else _last_enr.get("pr_enriched_count", 0)
+                _last_enr.setdefault("debug_log", []).extend(_manual_debug_log)
+                update_enrichment_stats(_last_sid, _last_enr)
+                st.session_state["_last_enrichment"] = _last_enr
+            except Exception:
+                pass
+
+    # On every rerun, merge cached enriched manual comps into the display dataframe
+    if st.session_state.get("_manual_comps_enriched"):
+        _manual_df = pd.DataFrame(st.session_state["_manual_comps_enriched"])
+        comps = pd.concat([comps, _manual_df], ignore_index=True)
 
     # Show added comps
     for _mi, _mc in enumerate(st.session_state["_manual_comps"]):
@@ -704,7 +752,12 @@ _table_html = (
     '  }\n'
     '  allTrs[startIdx].scrollIntoView({behavior:"smooth",block:"center"});\n'
     '}\n'
-    'function updateCount(){document.getElementById("selCnt").textContent=document.querySelectorAll(".sel-chk:checked").length;}\n'
+    'function updateCount(){'
+    '  const cnt=document.querySelectorAll(".sel-chk:checked").length;'
+    '  document.getElementById("selCnt").textContent=cnt;'
+    '  const sel=[];document.querySelectorAll(".sel-chk").forEach((c,i)=>{if(c.checked)sel.push(i);});'
+    '  try{window.parent.__comp_selection=JSON.stringify(sel);}catch(e){}'
+    '}\n'
     'updateCount();\n'
     'function applyFilter(){'
     '  if(!showSelOnly){allTrs.forEach(t=>t.classList.remove("hide-unselected"));return;}'
@@ -880,8 +933,7 @@ st.download_button(
 
 # ── PDF Appraisal Rebuttal Export ─────────────────────────────────────
 st.divider()
-st.subheader("📄 Export Appraisal Rebuttal PDF")
-st.caption("Select comparable properties and generate a professional PDF report to dispute an appraisal value.")
+st.subheader("Export Appraisal Rebuttal PDF")
 
 # Build address labels for the multiselect
 _addr_labels = []
@@ -890,17 +942,47 @@ for _i, _r in comps.iterrows():
     _sim = f"{_r['similarity']:.0f}%" if pd.notna(_r.get("similarity")) else ""
     _addr_labels.append(f"{_r.get('address', 'N/A')}, {_r.get('city', '')} — {_price} ({_sim} match)")
 
-selected_labels = st.multiselect(
-    "Select comps to include in the PDF",
-    options=_addr_labels,
-    default=None,
-    placeholder="Choose one or more comparable properties…",
-)
+# JS bridge: must run BEFORE multiselect so session_state is set before widget renders
+_sync_ver = st.session_state.get("_sel_sync_ver", 0)
+if _sync_ver > 0:
+    from streamlit_js_eval import streamlit_js_eval
+    _js_sel = streamlit_js_eval(
+        js_expressions="window.parent.__comp_selection || '[]'",
+        key=f"_comp_sel_v{_sync_ver}",
+    )
+    if _js_sel and isinstance(_js_sel, str):
+        try:
+            import json as _j2
+            _table_sel_indices = _j2.loads(_js_sel)
+            _new_labels = [_addr_labels[i] for i in _table_sel_indices if i < len(_addr_labels)]
+            if _new_labels != st.session_state.get("_rov_comp_select", []):
+                st.session_state["_rov_comp_select"] = _new_labels
+                st.rerun()
+        except Exception:
+            pass
+
+# Multiselect + sync button on same row
+_ms_col, _btn_col = st.columns([5, 1])
+with _ms_col:
+    selected_labels = st.multiselect(
+        "Comps for PDF",
+        options=_addr_labels,
+        placeholder="Choose one or more comparable properties…",
+        key="_rov_comp_select",
+    )
+with _btn_col:
+    st.markdown("<div style='margin-top:1.65rem'></div>", unsafe_allow_html=True)
+    if st.button("From Table ", use_container_width=True):
+        st.session_state["_sel_sync_ver"] = st.session_state.get("_sel_sync_ver", 0) + 1
+        st.rerun()
 
 if selected_labels:
     selected_indices = [_addr_labels.index(lbl) for lbl in selected_labels]
     selected_comps = comps.iloc[selected_indices].copy()
+else:
+    selected_comps = None
 
+if selected_comps is not None and not selected_comps.empty:
     # ── ROV-specific inputs ───────────────────────────────────────────
     client_name = st.text_input(
         "Borrower Name",
@@ -1103,33 +1185,141 @@ if selected_labels:
                 with open(output_path, "rb") as f:
                     pdf_bytes = f.read()
 
-                _subj_addr = subject.get("address", "property").replace(" ", "_")
-                st.success(f"✅ ROV generated with {len(selected_comps)} comparable properties")
-                st.download_button(
-                    label="📄 Download Filled ROV PDF",
-                    data=pdf_bytes,
-                    file_name=f"ROV_{_subj_addr}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                    type="primary",
-                )
+                # Store in session state for revision workflow
+                st.session_state["_rov_result"] = result
+                st.session_state["_rov_pdf_bytes"] = pdf_bytes
+                st.session_state["_rov_pdf_bytes_original"] = pdf_bytes
+                st.session_state["_rov_revision_count"] = 0
+                st.session_state["_rov_payload"] = payload
+                st.session_state["_rov_appraisal_bytes"] = appraisal_file.getvalue()
+                st.session_state["_rov_selected_pages"] = selected_pages
+                st.session_state["_rov_subject_addr"] = subject.get("address", "property")
+                st.session_state["_rov_comps_count"] = len(selected_comps)
 
                 # Log the ROV report
                 try:
                     _rov_user = get_user()
-                    log_rov_report(
+                    _report_id = log_rov_report(
                         user_email=(_rov_user or {}).get("email", "unknown"),
                         subject_address=subject.get("address", ""),
                         comps_count=len(selected_comps),
                         agent_json=result["agent_output"],
                         input_payload=payload,
                     )
+                    st.session_state["_rov_report_id"] = _report_id
                 except Exception:
-                    pass  # never block the UI for logging failures
+                    st.session_state["_rov_report_id"] = None
 
             except Exception as e:
                 st.error(f"Failed to generate ROV: {e}")
                 with st.expander("Error details"):
                     st.exception(e)
+
+    # ── Display generated ROV + revision UI ───────────────────────────────
+    if "_rov_pdf_bytes" in st.session_state:
+        _subj_addr = st.session_state.get("_rov_subject_addr", "property").replace(" ", "_")
+        _rev_count = st.session_state.get("_rov_revision_count", 0)
+        if _rev_count > 0:
+            st.success(f"✅ ROV revised (v{_rev_count + 1}) with {st.session_state.get('_rov_comps_count', 0)} comparable properties")
+            _dl_col1, _dl_col2 = st.columns(2)
+            with _dl_col1:
+                st.download_button(
+                    label=f"📄 Download Revised ROV (v{_rev_count + 1})",
+                    data=st.session_state["_rov_pdf_bytes"],
+                    file_name=f"ROV_{_subj_addr}_v{_rev_count + 1}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    type="primary",
+                )
+            with _dl_col2:
+                st.download_button(
+                    label="📄 Download Original ROV",
+                    data=st.session_state["_rov_pdf_bytes_original"],
+                    file_name=f"ROV_{_subj_addr}_original.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    type="secondary",
+                )
+        else:
+            st.success(f"✅ ROV generated with {st.session_state.get('_rov_comps_count', 0)} comparable properties")
+            st.download_button(
+                label="📄 Download Filled ROV PDF",
+                data=st.session_state["_rov_pdf_bytes"],
+                file_name=f"ROV_{_subj_addr}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                type="primary",
+            )
+
+        # ── Revision text area ────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("**Want to refine the ROV?** Add your edit suggestions below and regenerate.")
+        _revision_notes = st.text_area(
+            "Edit Suggestions",
+            placeholder="e.g. Emphasize the superior lot size of comp #2, mention the recent renovation...",
+            key="_rov_revision_notes",
+        )
+        _regen_clicked = st.button(
+            "🔄 Regenerate with Edits",
+            disabled=not (_revision_notes and _revision_notes.strip()),
+            use_container_width=True,
+        )
+
+        if _regen_clicked and _revision_notes.strip():
+            import tempfile
+            from pypdf import PdfReader as _PdfR2, PdfWriter as _PdfW2
+            import io as _io2
+
+            with tempfile.TemporaryDirectory() as _tmpdir2:
+                _ap_path2 = os.path.join(_tmpdir2, "appraisal.pdf")
+                _src2 = _PdfR2(_io2.BytesIO(st.session_state["_rov_appraisal_bytes"]))
+                _wr2 = _PdfW2()
+                for _pg in st.session_state["_rov_selected_pages"]:
+                    _wr2.add_page(_src2.pages[_pg - 1])
+                with open(_ap_path2, "wb") as _f2:
+                    _wr2.write(_f2)
+
+                _out_path2 = os.path.join(_tmpdir2, "revised_rov.pdf")
+
+                try:
+                    with st.spinner("Regenerating ROV with your edits..."):
+                        _rev_result = generate_rov_pdf(
+                            payload=st.session_state["_rov_payload"],
+                            appraisal_pdf_path=_ap_path2,
+                            blank_form_path="Main_ROV_blank.pdf",
+                            output_path=_out_path2,
+                            revision_notes=_revision_notes.strip(),
+                            previous_output=st.session_state["_rov_result"]["agent_output"],
+                        )
+
+                    with open(_out_path2, "rb") as _f2:
+                        _rev_pdf_bytes = _f2.read()
+
+                    # Update session state with revised version
+                    st.session_state["_rov_result"] = _rev_result
+                    st.session_state["_rov_pdf_bytes"] = _rev_pdf_bytes
+                    st.session_state["_rov_revision_count"] = st.session_state.get("_rov_revision_count", 0) + 1
+
+                    # Log the revision
+                    try:
+                        _rov_user = get_user()
+                        log_rov_revision(
+                            parent_id=st.session_state.get("_rov_report_id") or 0,
+                            user_email=(_rov_user or {}).get("email", "unknown"),
+                            subject_address=st.session_state.get("_rov_subject_addr", ""),
+                            comps_count=st.session_state.get("_rov_comps_count", 0),
+                            revision_notes=_revision_notes.strip(),
+                            revised_agent_json=_rev_result["agent_output"],
+                            input_payload=st.session_state.get("_rov_payload"),
+                        )
+                    except Exception:
+                        pass
+
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"Failed to regenerate ROV: {e}")
+                    with st.expander("Error details"):
+                        st.exception(e)
 else:
     st.info("Select at least one comparable property above to generate the ROV.")

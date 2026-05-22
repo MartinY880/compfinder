@@ -44,6 +44,7 @@ with tab1:
                 "User": r["user_email"],
                 "Subject": r["subject_address"],
                 "Comps": r["comps_count"],
+                "Type": "🔄 Revision" if r.get("revision_notes") else "Original",
                 "Generated": r["created_at"],
             }
             for r in reports
@@ -63,16 +64,26 @@ with tab1:
         if selected_id:
             report = next(r for r in reports if r["id"] == selected_id)
             st.subheader(f"Report #{selected_id} — {report['subject_address']}")
-            st.caption(f"User: {report['user_email']}  |  {report['created_at']}")
+            _is_revision = bool(report.get("revision_notes"))
+            _meta = f"User: {report['user_email']}  |  {report['created_at']}"
+            if _is_revision:
+                _meta += f"  |  🔄 Revision of #{report.get('parent_id', '?')}"
+            st.caption(_meta)
 
-            json_tab1, json_tab2 = st.tabs(["📤 Input Payload (sent to Claude)", "📥 Claude Response"])
-            with json_tab1:
+            _tabs = ["📤 Input Payload (sent to Claude)", "📥 Claude Response"]
+            if _is_revision:
+                _tabs.append("✏️ Revision Notes")
+            json_tabs = st.tabs(_tabs)
+            with json_tabs[0]:
                 if report.get("input_payload"):
                     st.json(report["input_payload"])
                 else:
                     st.info("No input payload stored for this report (generated before this feature).")
-            with json_tab2:
-                st.json(report["agent_json"])
+            with json_tabs[1]:
+                st.json(report.get("revised_agent_json") or report["agent_json"])
+            if _is_revision:
+                with json_tabs[2]:
+                    st.markdown(report["revision_notes"])
 
 # ── Search History ────────────────────────────────────────────────────────────
 with tab2:
@@ -112,4 +123,32 @@ with tab2:
             search = next(s for s in searches if s["id"] == selected_search_id)
             st.subheader(f"Search #{selected_search_id} — {search['subject_address']}")
             st.caption(f"User: {search['user_email']}  |  {search['created_at']}  |  {search['result_count']} results")
-            st.json(search["filters"])
+
+            _stab1, _stab2 = st.tabs(["🔍 Filters", "🔗 PR Enrichment Debug"])
+            with _stab1:
+                st.json(search["filters"])
+            with _stab2:
+                _enr = search.get("enrichment_stats")
+                if not _enr:
+                    st.info("No enrichment data stored for this search.")
+                else:
+                    # Summary metrics
+                    _ec1, _ec2, _ec3, _ec4 = st.columns(4)
+                    _ec1.metric("Total Comps", _enr.get("total_comps", 0))
+                    _ec2.metric("PR Enriched", _enr.get("pr_enriched_count", 0))
+                    _ec3.metric("APNs Queried", _enr.get("pr_apns_queried", 0))
+                    _ec4.metric("APNs Returned", _enr.get("pr_apns_returned", 0))
+
+                    # Per-comp debug log table
+                    _dlog = _enr.get("debug_log", [])
+                    if _dlog:
+                        st.markdown("**Per-Comp Enrichment Detail**")
+                        _dlog_df = pd.DataFrame(_dlog)
+                        # Reorder columns for readability
+                        _preferred_cols = ["address", "apn_raw", "apn_normalized", "match_method", "pr_path", "result", "hc_sale_date", "pr_date", "pr_price"]
+                        _ordered = [c for c in _preferred_cols if c in _dlog_df.columns]
+                        _ordered += [c for c in _dlog_df.columns if c not in _ordered]
+                        st.dataframe(_dlog_df[_ordered], use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No per-comp debug log available (PR may have returned no results).")
+

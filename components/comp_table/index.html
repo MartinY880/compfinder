@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:transparent;overflow:hidden;}
+.tw{width:100%;overflow-x:auto;font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-size:13px;}
+table{border-collapse:collapse;width:100%;min-width:1200px;}
+th{position:sticky;top:0;background:#0f172a;color:#e2e8f0;padding:8px 10px;text-align:left;font-weight:600;border-bottom:2px solid #334155;white-space:nowrap;z-index:2;}
+td{padding:6px 10px;border-bottom:1px solid #1e293b;white-space:nowrap;vertical-align:middle;}
+tr{transition:filter .15s;}tr:hover{filter:brightness(1.2);}
+tr.selected{outline:2px solid #38bdf8;outline-offset:-2px;}
+tr.hide-unselected{display:none;}
+.thumb{width:80px;height:54px;object-fit:cover;border-radius:4px;cursor:pointer;transition:transform .2s;}
+.thumb:hover{transform:scale(1.08);}
+.lb{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.88);display:none;align-items:center;justify-content:center;z-index:9999;cursor:pointer;flex-direction:column;}
+.lb img{max-width:90%;max-height:80%;border-radius:8px;box-shadow:0 0 40px rgba(0,0,0,.5);}
+.lb .info{color:#f1f5f9;margin-top:12px;font-size:14px;background:rgba(30,41,59,.85);padding:8px 20px;border-radius:6px;}
+.toolbar{display:flex;align-items:center;gap:10px;padding:8px 12px;background:#1e293b;border-bottom:1px solid #334155;}
+.toolbar .sel-count{font-size:13px;color:#94a3b8;}
+.toolbar .sel-count b{color:#38bdf8;}
+.toolbar button{background:#334155;border:1px solid #475569;color:#e2e8f0;padding:5px 14px;border-radius:6px;cursor:pointer;font-size:12px;transition:all .15s;}
+.toolbar button:hover{background:#475569;}
+.toolbar button.active{background:#38bdf8;color:#0f172a;border-color:#38bdf8;}
+.sel-chk{width:16px;height:16px;accent-color:#38bdf8;cursor:pointer;}
+</style>
+</head>
+<body>
+<div class="toolbar">
+  <span class="sel-count"><b id="selCnt">0</b> selected</span>
+  <button id="btnShowSel" onclick="toggleShowSelected()">Show Selected Only</button>
+  <button onclick="clearSelection()">Clear Selection</button>
+</div>
+<div class="tw"><table><thead><tr id="hdr"></tr></thead><tbody id="tbody"></tbody></table></div>
+<div class="lb" id="lb" onclick="this.style.display='none'"><img id="lbI"><div class="info" id="lbT"></div></div>
+
+<script>
+// Streamlit component communication protocol
+function sendToStreamlit(value) {
+    window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: "streamlit:setComponentValue",
+        value: value
+    }, "*");
+}
+
+function signalReady() {
+    window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: "streamlit:componentReady",
+        apiVersion: 1
+    }, "*");
+}
+
+function setFrameHeight(height) {
+    window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: "streamlit:setFrameHeight",
+        height: height
+    }, "*");
+}
+
+const tierBg = {"Green": "#166534", "Yellow": "#a16207", "Red": "#991b1b"};
+let showSelOnly = false;
+let allTrs = [];
+let rows = [];
+let hdrs = [];
+let numManual = 0;
+
+function getSelectedIndices() {
+    const indices = [];
+    document.querySelectorAll(".sel-chk").forEach((chk, i) => {
+        if (chk.checked) indices.push(i);
+    });
+    return indices;
+}
+
+function updateCount() {
+    const count = document.querySelectorAll(".sel-chk:checked").length;
+    document.getElementById("selCnt").textContent = count;
+    // Send selection back to Streamlit
+    sendToStreamlit(getSelectedIndices());
+}
+
+function applyFilter() {
+    if (!showSelOnly) {
+        allTrs.forEach(t => t.classList.remove("hide-unselected"));
+    } else {
+        allTrs.forEach(t => {
+            const chk = t.querySelector(".sel-chk");
+            t.classList.toggle("hide-unselected", !chk.checked);
+        });
+    }
+    updateFrameHeight();
+}
+
+function toggleShowSelected() {
+    showSelOnly = !showSelOnly;
+    document.getElementById("btnShowSel").classList.toggle("active", showSelOnly);
+    document.getElementById("btnShowSel").textContent = showSelOnly ? "Show All" : "Show Selected Only";
+    applyFilter();
+}
+
+function clearSelection() {
+    document.querySelectorAll(".sel-chk").forEach(c => { c.checked = false; });
+    allTrs.forEach(t => t.classList.remove("selected"));
+    showSelOnly = false;
+    document.getElementById("btnShowSel").classList.remove("active");
+    document.getElementById("btnShowSel").textContent = "Show Selected Only";
+    updateCount();
+    applyFilter();
+}
+
+function updateFrameHeight() {
+    setTimeout(() => {
+        setFrameHeight(document.body.scrollHeight + 10);
+    }, 50);
+}
+
+function renderTable(data) {
+    rows = data.rows || [];
+    hdrs = data.headers || [];
+    numManual = data.numManual || 0;
+
+    const hdr = document.getElementById("hdr");
+    const tbody = document.getElementById("tbody");
+    hdr.innerHTML = "";
+    tbody.innerHTML = "";
+    allTrs = [];
+
+    // Header: checkbox column + data columns
+    const thSel = document.createElement("th");
+    thSel.textContent = "\u2714";
+    thSel.style.width = "36px";
+    thSel.style.textAlign = "center";
+    hdr.appendChild(thSel);
+    hdrs.forEach(h => {
+        const th = document.createElement("th");
+        th.textContent = h;
+        hdr.appendChild(th);
+    });
+
+    // Body rows
+    rows.forEach((r, i) => {
+        const tr = document.createElement("tr");
+        const bg = tierBg[r.tier] || "transparent";
+        tr.style.cssText = "background:" + bg + ";color:#fff;";
+        tr.dataset.idx = i;
+
+        const tdSel = document.createElement("td");
+        tdSel.style.textAlign = "center";
+        const chk = document.createElement("input");
+        chk.type = "checkbox";
+        chk.className = "sel-chk";
+        chk.onchange = () => {
+            tr.classList.toggle("selected", chk.checked);
+            updateCount();
+            applyFilter();
+        };
+        tdSel.appendChild(chk);
+        tr.appendChild(tdSel);
+
+        const td0 = document.createElement("td");
+        if (r.photo) {
+            const img = document.createElement("img");
+            img.className = "thumb";
+            img.src = r.photo;
+            img.onclick = () => {
+                document.getElementById("lbI").src = r.photo;
+                document.getElementById("lbT").textContent = r.cells[0] + " \u00B7 " + r.cells.slice(-3).join(" \u00B7 ");
+                document.getElementById("lb").style.display = "flex";
+            };
+            td0.appendChild(img);
+        } else {
+            td0.textContent = "\u2014";
+        }
+        tr.appendChild(td0);
+
+        r.cells.forEach(v => {
+            const td = document.createElement("td");
+            td.textContent = v;
+            tr.appendChild(td);
+        });
+
+        tbody.appendChild(tr);
+        allTrs.push(tr);
+    });
+
+    // Auto-select manual comps
+    if (numManual > 0) {
+        const startIdx = rows.length - numManual;
+        for (let i = startIdx; i < rows.length; i++) {
+            const chk = allTrs[i].querySelector(".sel-chk");
+            if (chk && !chk.checked) {
+                chk.checked = true;
+                allTrs[i].classList.add("selected");
+            }
+        }
+        allTrs[startIdx].scrollIntoView({behavior: "smooth", block: "center"});
+    }
+
+    updateCount();
+    updateFrameHeight();
+}
+
+// Listen for render messages from Streamlit
+window.addEventListener("message", (event) => {
+    if (event.data.type === "streamlit:render") {
+        const args = event.data.args;
+        if (args && args.data) {
+            renderTable(args.data);
+        }
+    }
+});
+
+// Signal that component is ready
+signalReady();
+</script>
+</body>
+</html>

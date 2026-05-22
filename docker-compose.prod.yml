@@ -44,6 +44,8 @@ services:
       - LOGTO_API_RESOURCE=${LOGTO_API_RESOURCE}
       # Claude
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # PropertyRadar
+      - PROPERTYRADAR_API_TOKEN=${PROPERTYRADAR_API_TOKEN}
       # Database
       - DATABASE_URL=postgresql://compfinder:${POSTGRES_PASSWORD}@db:5432/compfinder
     volumes:

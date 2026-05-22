@@ -1,4 +1,5 @@
 streamlit>=1.37.0
+streamlit-js-eval>=0.1.7
 snowflake-connector-python[secure-local-storage]>=3.6.0
 cryptography>=41.0.0
 pandas>=2.0.0

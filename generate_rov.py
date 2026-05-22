@@ -24,6 +24,8 @@ def generate_rov_pdf(
     skill_path: str = "SKILL.md",
     model: str = "claude-sonnet-4-6",
     api_key: str | None = None,
+    revision_notes: str | None = None,
+    previous_output: dict | None = None,
 ) -> dict:
     """
     Full pipeline: JSON + appraisal PDF -> filled ROV PDF.
@@ -37,6 +39,8 @@ def generate_rov_pdf(
         skill_path=skill_path,
         model=model,
         api_key=api_key,
+        revision_notes=revision_notes,
+        previous_output=previous_output,
     )
     build_rov_pdf(blank_form_path, agent_output, output_path)
     return {"pdf_path": output_path, "agent_output": agent_output}
