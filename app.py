@@ -686,8 +686,10 @@ _num_manual = len(st.session_state.get("_manual_comps", []))
 _table_html = (
     '<style>'
     '*{box-sizing:border-box;margin:0;padding:0;}'
-    '.tw{width:100%;overflow-x:auto;font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-size:13px;}'
-    'table{border-collapse:collapse;width:100%;min-width:1200px;}'
+    'html,body{height:100%;}'
+    'body{display:flex;flex-direction:column;}'
+    '.tw{flex:1;min-height:0;width:100%;overflow:auto;font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-size:13px;}'
+    'table{border-collapse:separate;border-spacing:0;width:100%;min-width:1200px;}'
     'th{position:sticky;top:0;background:#0f172a;color:#e2e8f0;padding:8px 10px;text-align:left;font-weight:600;border-bottom:2px solid #334155;white-space:nowrap;z-index:2;}'
     'td{padding:6px 10px;border-bottom:1px solid #1e293b;white-space:nowrap;vertical-align:middle;}'
     'tr{transition:filter .15s;}tr:hover{filter:brightness(1.2);}'

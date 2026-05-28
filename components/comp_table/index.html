@@ -3,10 +3,11 @@
 <head>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;}
-body{background:transparent;overflow:hidden;}
-.tw{width:100%;overflow-x:auto;font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-size:13px;}
-table{border-collapse:collapse;width:100%;min-width:1200px;}
-th{position:sticky;top:0;background:#0f172a;color:#e2e8f0;padding:8px 10px;text-align:left;font-weight:600;border-bottom:2px solid #334155;white-space:nowrap;z-index:2;}
+html,body{height:100%;background:transparent;overflow:hidden;}
+body{display:flex;flex-direction:column;}
+.tw{flex:1;min-height:0;width:100%;overflow-x:auto;overflow-y:auto;font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-size:13px;}
+table{border-collapse:separate;border-spacing:0;width:100%;min-width:1200px;}
+th{position:sticky;top:0;background:#0f172a;color:#e2e8f0;padding:8px 10px;text-align:left;font-weight:600;border-bottom:2px solid #334155;white-space:nowrap;z-index:3;}
 td{padding:6px 10px;border-bottom:1px solid #1e293b;white-space:nowrap;vertical-align:middle;}
 tr{transition:filter .15s;}tr:hover{filter:brightness(1.2);}
 tr.selected{outline:2px solid #38bdf8;outline-offset:-2px;}
@@ -112,9 +113,8 @@ function clearSelection() {
 }
 
 function updateFrameHeight() {
-    setTimeout(() => {
-        setFrameHeight(document.body.scrollHeight + 10);
-    }, 50);
+    // iframe height is controlled by Streamlit via _components.html height param
+    // .tw fills remaining space via flexbox, no JS sizing needed
 }
 
 function renderTable(data) {
