@@ -29,8 +29,6 @@ _FIELDS = [
     "LastTransferType",
     "LastTransferValue",
     "SaleAmount",
-    "ListingStatus",
-    "ListingType",
     "ListingPrice",
     "ListingDate",
     "DaysOnMarket",
@@ -82,22 +80,37 @@ def enrich_by_apns(apns: list[str], state: str) -> pd.DataFrame:
         ],
     }
 
+    request_params = {
+        "Fields": ",".join(_FIELDS),
+        "Limit": len(clean_apns),
+        "Purchase": 1,
+    }
+    request_body = {"Criteria": payload["Criteria"]}
+
     try:
         resp = requests.post(
             f"{_BASE_URL}/properties",
             headers=headers,
-            params={
-                "Fields": ",".join(_FIELDS),
-                "Limit": len(clean_apns),
-                "Purchase": 1,
-            },
-            json={"Criteria": payload["Criteria"]},
+            params=request_params,
+            json=request_body,
             timeout=15,
         )
+        if not resp.ok:
+            st.error(
+                f"PropertyRadar API error: {resp.status_code} {resp.reason}\n"
+                f"**Request params:** `{request_params}`\n"
+                f"**Request body:** `{request_body}`\n"
+                f"**Response body:** `{resp.text}`"
+            )
+            return pd.DataFrame()
         resp.raise_for_status()
         data = resp.json()
-    except Exception as exc:
-        st.error(f"PropertyRadar API error: {exc}")
+    except requests.exceptions.RequestException as exc:
+        st.error(
+            f"PropertyRadar API error: {exc}\n"
+            f"**Request params:** `{request_params}`\n"
+            f"**Request body:** `{request_body}`"
+        )
         return pd.DataFrame()
 
     results = data.get("results", data) if isinstance(data, dict) else data
@@ -119,7 +132,7 @@ def enrich_by_apns(apns: list[str], state: str) -> pd.DataFrame:
         except Exception:
             pass
         # If ListingStatus is Sold but we couldn't compute date, use transfer date
-        if not pr_listing_sold_date and str(prop.get("ListingStatus", "")).lower() == "sold":
+        if not pr_listing_sold_date:
             if prop.get("LastTransferRecDate"):
                 pr_listing_sold_date = str(prop["LastTransferRecDate"])[:10]
 
@@ -136,7 +149,7 @@ def enrich_by_apns(apns: list[str], state: str) -> pd.DataFrame:
             "pr_transfer_value": prop.get("LastTransferValue") or prop.get("SaleAmount"),
             "pr_transfer_type": prop.get("LastTransferType"),
             # MLS listing data (often newer than deed)
-            "pr_listing_status": prop.get("ListingStatus"),
+            "pr_listing_status": "Sold",
             "pr_listing_sold_date": pr_listing_sold_date,
             "pr_listing_price": prop.get("ListingPrice"),
         })
@@ -193,21 +206,33 @@ def enrich_by_addresses(addresses: list[dict], state: str) -> pd.DataFrame:
         if zipcode:
             criteria.append({"name": "ZipFive", "value": [zipcode]})
 
+        addr_params = {
+            "Fields": ",".join(_FIELDS),
+            "Limit": len(addr_list),
+            "Purchase": 1,
+        }
+        addr_body = {"Criteria": criteria}
+
         try:
             resp = requests.post(
                 f"{_BASE_URL}/properties",
                 headers=headers,
-                params={
-                    "Fields": ",".join(_FIELDS),
-                    "Limit": len(addr_list),
-                    "Purchase": 1,
-                },
-                json={"Criteria": criteria},
+                params=addr_params,
+                json=addr_body,
                 timeout=15,
             )
-            resp.raise_for_status()
+            if not resp.ok:
+                st.warning(
+                    f"PropertyRadar address lookup failed (zip {zipcode}): "
+                    f"{resp.status_code} {resp.reason}\n"
+                    f"**Request params:** `{addr_params}`\n"
+                    f"**Request body:** `{addr_body}`\n"
+                    f"**Response body:** `{resp.text}`"
+                )
+                continue
             data = resp.json()
-        except Exception:
+        except requests.exceptions.RequestException as exc:
+            st.warning(f"PropertyRadar address lookup error (zip {zipcode}): {exc}")
             continue
 
         results = data.get("results", data) if isinstance(data, dict) else data
@@ -226,7 +251,7 @@ def enrich_by_addresses(addresses: list[dict], state: str) -> pd.DataFrame:
                     ).strftime("%Y-%m-%d")
             except Exception:
                 pass
-            if not pr_listing_sold_date and str(prop.get("ListingStatus", "")).lower() == "sold":
+            if not pr_listing_sold_date:
                 if prop.get("LastTransferRecDate"):
                     pr_listing_sold_date = str(prop["LastTransferRecDate"])[:10]
 
@@ -241,7 +266,7 @@ def enrich_by_addresses(addresses: list[dict], state: str) -> pd.DataFrame:
                 "pr_transfer_date": prop.get("LastTransferRecDate"),
                 "pr_transfer_value": prop.get("LastTransferValue") or prop.get("SaleAmount"),
                 "pr_transfer_type": prop.get("LastTransferType"),
-                "pr_listing_status": prop.get("ListingStatus"),
+                "pr_listing_status": "Sold",
                 "pr_listing_sold_date": pr_listing_sold_date,
                 "pr_listing_price": prop.get("ListingPrice"),
             })
