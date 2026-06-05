@@ -683,6 +683,28 @@ _rows_json = _json.dumps(_rows)
 _headers_json = _json.dumps(["Photo"] + [_col_labels.get(c, c) for c in display_cols])
 _num_manual = len(st.session_state.get("_manual_comps", []))
 
+import html as _htmlesc
+_sv = lambda val, fmt=None: (
+    "N/A" if (val is None or (isinstance(val, float) and pd.isna(val)))
+    else (f"${float(val):,.0f}" if fmt == "$" else (f"{int(val):,}" if fmt == "," else str(val)))
+)
+_subj_addr_esc = _htmlesc.escape(
+    f"📍  {subject.get('address', '')}  ·  {subject.get('city', '')} {subject.get('state', '')} {subject.get('zipcode', '')}"
+)
+_subj_fields_html = "".join(
+    f'<div class="subj-field"><span class="subj-lbl">{lbl}</span><span class="subj-val">{_htmlesc.escape(val)}</span></div>'
+    for lbl, val in [
+        ("Beds",     _sv(subject.get("bedrooms"))),
+        ("Baths",    _sv(subject.get("bathrooms"))),
+        ("SqFt",     _sv(subject.get("sqft"), ",")),
+        ("Lot",      _sv(subject.get("lot_size"), ",")),
+        ("Yr Built", _sv(subject.get("year_built"))),
+        ("AVM",      _sv(subject.get("avm_value"), "$")),
+        ("Type",     _sv(subject.get("property_type"))),
+    ]
+)
+_subj_bar_html = f'<div class="subj-bar"><span class="subj-addr">{_subj_addr_esc}</span>{_subj_fields_html}</div>'
+
 _table_html = (
     '<style>'
     '*{box-sizing:border-box;margin:0;padding:0;}'
@@ -707,7 +729,16 @@ _table_html = (
     '.toolbar button:hover{background:#475569;}'
     '.toolbar button.active{background:#38bdf8;color:#0f172a;border-color:#38bdf8;}'
     '.sel-chk{width:16px;height:16px;accent-color:#38bdf8;cursor:pointer;}'
+    '.edit-icon{cursor:pointer;margin-left:4px;font-size:11px;color:#38bdf8;opacity:.75;vertical-align:middle;display:inline-block;}'
+    '.edit-icon:hover{opacity:1;color:#7dd3fc;}'
+    '.edit-inp{background:#1e293b;color:#e2e8f0;border:1px solid #38bdf8;border-radius:3px;padding:2px 5px;width:90px;font-size:12px;outline:none;}'
+    '.subj-bar{position:sticky;top:0;z-index:3;background:#060f1e;border-bottom:2px solid #38bdf8;padding:7px 14px;display:flex;align-items:center;gap:16px;flex-wrap:wrap;}'
+    '.subj-addr{font-size:12px;color:#38bdf8;font-weight:700;white-space:nowrap;flex-shrink:0;}'
+    '.subj-field{display:flex;flex-direction:column;line-height:1.25;}'
+    '.subj-lbl{font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:.06em;}'
+    '.subj-val{font-size:12px;color:#e2e8f0;font-weight:600;white-space:nowrap;}'
     '</style>'
+    + _subj_bar_html +
     '<div class="toolbar">'
     '  <span class="sel-count"><b id="selCnt">0</b> selected</span>'
     '  <button id="btnShowSel" onclick="toggleShowSelected()">Show Selected Only</button>'
@@ -719,6 +750,7 @@ _table_html = (
     'const rows=' + _rows_json + ';'
     'const hdrs=' + _headers_json + ';'
     'const numManual=' + str(_num_manual) + ';'
+    'const dispCols=' + _json.dumps(display_cols) + ';'
     'const tierBg={"Green":"#166534","Yellow":"#a16207","Red":"#991b1b"};'
     'let showSelOnly=false;'
     'const hdr=document.getElementById("hdr");'
@@ -726,6 +758,7 @@ _table_html = (
     'hdrs.forEach(h=>{const th=document.createElement("th");th.textContent=h;hdr.appendChild(th);});'
     'const tbody=document.getElementById("tbody");'
     'const allTrs=[];'
+    'const noEdit=new Set(["distance_miles","similarity","match_tier"]);'
     'rows.forEach((r,i)=>{'
     '  const tr=document.createElement("tr");'
     '  const bg=tierBg[r.tier]||"transparent";'
@@ -742,7 +775,16 @@ _table_html = (
     '    td0.appendChild(img);'
     '  } else {td0.textContent="—";}'
     '  tr.appendChild(td0);'
-    '  r.cells.forEach(v=>{const td=document.createElement("td");td.textContent=v;tr.appendChild(td);});'
+    '  r.cells.forEach(function(v,ci){'
+    '    const td=document.createElement("td");'
+    '    if(numManual>0&&i>=rows.length-numManual&&v==="N/A"&&!noEdit.has(dispCols[ci])){'
+    '      const sna=document.createElement("span");sna.textContent="N/A";'
+    '      const sic=document.createElement("span");sic.className="edit-icon";sic.title="Edit value";sic.textContent="✏";'
+    '      sic.onclick=(function(ri,ci2){return function(){startEdit(sic,ri,ci2);};})(i,ci);'
+    '      td.appendChild(sna);td.appendChild(sic);'
+    '    }else{td.textContent=v;}'
+    '    tr.appendChild(td);'
+    '  });'
     '  tbody.appendChild(tr);'
     '  allTrs.push(tr);'
     '});\n'
@@ -782,11 +824,39 @@ _table_html = (
     '  document.getElementById("btnShowSel").textContent="Show Selected Only";'
     '  updateCount();applyFilter();'
     '}'
+    'function startEdit(el,ri,ci){'
+    '  const td=el.parentElement;'
+    '  const cn=dispCols[ci];'
+    '  function restoreIcon(){'
+    '    const s=document.createElement("span");s.textContent="N/A";'
+    '    const ic=document.createElement("span");ic.className="edit-icon";ic.title="Edit value";ic.textContent="✏";'
+    '    ic.onclick=function(){startEdit(ic,ri,ci);};'
+    '    td.innerHTML="";td.appendChild(s);td.appendChild(ic);'
+    '  }'
+    '  const inp=document.createElement("input");'
+    '  inp.type="text";inp.className="edit-inp";inp.placeholder="Enter value";'
+    '  inp.onblur=function(){'
+    '    const v=inp.value.trim();'
+    '    if(!v){restoreIcon();return;}'
+    '    td.textContent=v;'
+    '    try{'
+    '      if(!window.parent.__comp_edits)window.parent.__comp_edits={};'
+    '      if(!window.parent.__comp_edits[ri])window.parent.__comp_edits[ri]={};'
+    '      window.parent.__comp_edits[ri][cn]=v;'
+    '      window.parent.__comp_edits_json=JSON.stringify(window.parent.__comp_edits);'
+    '    }catch(ex){}'
+    '  };'
+    '  inp.onkeydown=function(e){'
+    '    if(e.key==="Enter")inp.blur();'
+    '    else if(e.key==="Escape")restoreIcon();'
+    '  };'
+    '  td.innerHTML="";td.appendChild(inp);inp.focus();'
+    '}'
     '</script>'
 )
 
 _num_rows = len(comps)
-_table_height = min(70 + _num_rows * 68, 800)
+_table_height = min(110 + _num_rows * 68, 860)
 _components.html(_table_html, height=_table_height, scrolling=True)
 
 # Tier legend
@@ -795,6 +865,56 @@ st.markdown(
     "🟡 **Yellow** = Moderate match (50–79%)  ·  "
     "🔴 **Red** = Weak match (<50%)",
 )
+
+# ── Manual comp cell edit sync ────────────────────────────────────────
+_edit_sync_ver = st.session_state.get("_edit_sync_ver", 0)
+if st.session_state.get("_manual_comps_enriched"):
+    if st.button("✅ Apply Manual Edits", key="_apply_edits_btn",
+                 help="Click after editing N/A cells in the table above to save your changes"):
+        st.session_state["_edit_sync_ver"] = _edit_sync_ver + 1
+        st.rerun()
+
+if _edit_sync_ver > 0:
+    from streamlit_js_eval import streamlit_js_eval as _sje_edits
+    _js_edits_raw = _sje_edits(
+        js_expressions="window.parent.__comp_edits_json || null",
+        key=f"_comp_edits_v{_edit_sync_ver}",
+    )
+    if _js_edits_raw is not None:
+        st.session_state["_edit_sync_ver"] = 0
+        if _js_edits_raw and _js_edits_raw != "null":
+            try:
+                import json as _je
+                _edits = _je.loads(_js_edits_raw)
+                _enriched = list(st.session_state.get("_manual_comps_enriched", []))
+                _base_count = len(st.session_state.get("_results_comps", pd.DataFrame()))
+                for _ridx_s, _col_map in _edits.items():
+                    _midx = int(_ridx_s) - _base_count
+                    if 0 <= _midx < len(_enriched):
+                        _int_cols = {"bedrooms", "year_built", "stories"}
+                        _float_cols = {"bathrooms", "sqft", "above_grade_sqft", "lot_size",
+                                       "sale_price", "price_per_sqft", "distance_miles", "similarity"}
+                        for _col, _raw in _col_map.items():
+                            _clean = str(_raw).replace(",", "").replace("$", "").strip()
+                            try:
+                                if _col in _int_cols:
+                                    _enriched[_midx][_col] = int(float(_clean))
+                                elif _col in _float_cols:
+                                    _enriched[_midx][_col] = float(_clean)
+                                else:
+                                    _enriched[_midx][_col] = _raw
+                            except (ValueError, TypeError):
+                                _enriched[_midx][_col] = _raw
+                        # Auto-recalc price_per_sqft when sale_price or sqft edited
+                        if ("sale_price" in _col_map or "sqft" in _col_map) and "price_per_sqft" not in _col_map:
+                            _sp = _enriched[_midx].get("sale_price")
+                            _sf = _enriched[_midx].get("sqft")
+                            if _sp and _sf and float(_sf) > 0:
+                                _enriched[_midx]["price_per_sqft"] = float(_sp) / float(_sf)
+                st.session_state["_manual_comps_enriched"] = _enriched
+                st.rerun()
+            except Exception:
+                pass
 
 # ── Map view (precise pins) ───────────────────────────────────────────
 st.subheader("Map")
