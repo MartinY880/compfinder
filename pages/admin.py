@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 
 from auth import require_auth, has_role, has_scope
-from db import get_rov_reports, get_comp_searches
+from db import get_rov_reports, get_comp_searches, get_escalations
 
 st.set_page_config(page_title="Admin — Comp Finder", page_icon="🔧", layout="wide")
 
@@ -22,7 +22,7 @@ if not (has_scope("manage:compfinder") or has_role("manage:compfinder")):
 st.title("🔧 Admin Panel")
 st.caption("ROV report history and comp search logs")
 
-tab1, tab2 = st.tabs(["📄 ROV Reports", "🔍 Search History"])
+tab1, tab2, tab3 = st.tabs(["📄 ROV Reports", "🔍 Search History", "🚨 Escalations"])
 
 # ── ROV Reports ───────────────────────────────────────────────────────────────
 with tab1:
@@ -151,4 +151,56 @@ with tab2:
                         st.dataframe(_dlog_df[_ordered], use_container_width=True, hide_index=True)
                     else:
                         st.info("No per-comp debug log available (PR may have returned no results).")
+
+# ── Escalations ───────────────────────────────────────────────────────────────
+with tab3:
+    try:
+        escalations = get_escalations(limit=200)
+    except Exception as e:
+        st.error(f"Failed to load escalations: {e}")
+        escalations = []
+
+    if not escalations:
+        st.info("No escalations generated yet.")
+    else:
+        st.caption(f"{len(escalations)} escalations")
+
+        df3 = pd.DataFrame([
+            {
+                "ID": e["id"],
+                "Address": e["address"],
+                "Loan #": e["loan_number"],
+                "Borrower": e["borrower_name"],
+                "Generated": e["generated_at"],
+            }
+            for e in escalations
+        ])
+        st.dataframe(df3, use_container_width=True, hide_index=True)
+
+        st.divider()
+        selected_esc_id = st.selectbox(
+            "Inspect Claude JSON for escalation ID",
+            options=[e["id"] for e in escalations],
+            format_func=lambda i: next(
+                f"#{i} — {e['address']} ({e['generated_at'].strftime('%Y-%m-%d %H:%M')})"
+                for e in escalations if e["id"] == i
+            ),
+        )
+        if selected_esc_id:
+            esc = next(e for e in escalations if e["id"] == selected_esc_id)
+            st.subheader(f"Escalation #{selected_esc_id} — {esc['address']}")
+            st.caption(
+                f"Loan: {esc['loan_number']}  |  Borrower: {esc['borrower_name']}  |  {esc['generated_at']}"
+            )
+            _etab1, _etab2 = st.tabs(["📤 Input Payload (sent to Claude)", "📥 Claude Response"])
+            with _etab1:
+                if esc.get("input_payload"):
+                    st.json(esc["input_payload"])
+                else:
+                    st.info("No input payload stored for this escalation (generated before this feature).")
+            with _etab2:
+                if esc.get("agent_json"):
+                    st.json(esc["agent_json"])
+                else:
+                    st.info("No Claude JSON stored for this escalation (generated before this feature).")
 

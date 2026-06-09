@@ -62,6 +62,18 @@ def init_db():
 
                 -- Add enrichment_stats column if it doesn't exist yet
                 ALTER TABLE comp_searches ADD COLUMN IF NOT EXISTS enrichment_stats JSONB;
+
+                CREATE TABLE IF NOT EXISTS escalations (
+                    id              SERIAL PRIMARY KEY,
+                    address         TEXT,
+                    loan_number     TEXT,
+                    borrower_name   TEXT,
+                    generated_at    TIMESTAMP DEFAULT NOW(),
+                    output_pdf_path TEXT
+                );
+
+                ALTER TABLE escalations ADD COLUMN IF NOT EXISTS agent_json JSONB;
+                ALTER TABLE escalations ADD COLUMN IF NOT EXISTS input_payload JSONB;
             """)
 
 
@@ -119,6 +131,37 @@ def log_comp_search(
             return row[0] if row else None
 
 
+def log_escalation(
+    address: str,
+    loan_number: str,
+    borrower_name: str,
+    output_pdf_path: str | None = None,
+    agent_json: dict | None = None,
+    input_payload: dict | None = None,
+) -> int:
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO escalations (address, loan_number, borrower_name, output_pdf_path, agent_json, input_payload) "
+                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                (address, loan_number, borrower_name, output_pdf_path,
+                 json.dumps(agent_json) if agent_json else None,
+                 json.dumps(input_payload) if input_payload else None),
+            )
+            return cur.fetchone()[0]
+
+
+def get_escalations(limit: int = 200) -> list[dict]:
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, address, loan_number, borrower_name, generated_at, output_pdf_path, agent_json, input_payload "
+                "FROM escalations ORDER BY generated_at DESC LIMIT %s",
+                (limit,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
 def update_enrichment_stats(search_id: int, enrichment_summary: dict):
     """Update the enrichment_stats JSONB for an existing search record."""
     with _get_conn() as conn:
@@ -154,7 +197,23 @@ def get_comp_searches(limit: int = 200) -> list[dict]:
             return [dict(r) for r in cur.fetchall()]
 
 
-def find_recent_search(subject_address: str, days: int = 7) -> dict | None:
+def find_recent_escalation(address: str, days: int = 60) -> dict | None:
+    """Return the most recent escalation for this address within `days`, or None."""
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, address, loan_number, borrower_name, generated_at, agent_json "
+                "FROM escalations "
+                "WHERE LOWER(address) = LOWER(%s) "
+                "  AND generated_at >= NOW() - INTERVAL '%s days' "
+                "ORDER BY generated_at DESC LIMIT 1",
+                (address, days),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def find_recent_search(subject_address: str, days: int = 60) -> dict | None:
     """Return the most recent ROV report for this address within `days`, or None."""
     with _get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:

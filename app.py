@@ -5,6 +5,7 @@ Find near-identical comparable properties using HouseCanary data via Snowflake.
 """
 
 import os
+import tempfile
 import requests
 import streamlit as st
 import pandas as pd
@@ -20,7 +21,9 @@ import propertyradar_client
 from auth import _delete_cookie as _auth_delete_cookie
 from auth import _set_logout_flag_cookie, _redirect_top, has_scope, has_role
 from generate_rov import generate_rov_pdf
-from db import init_db, log_comp_search, log_rov_report, log_rov_revision, find_recent_search, update_enrichment_stats
+from db import init_db, log_comp_search, log_rov_report, log_rov_revision, find_recent_search, update_enrichment_stats, log_escalation, find_recent_escalation
+import escalation_agent
+import escalation_pdf_builder
 
 init_db()
 
@@ -290,47 +293,350 @@ else:
 
 search_clicked = st.button("🔍 Find Comps", type="primary", use_container_width=True)
 
-# ── Duplicate search warning ──────────────────────────────────────────────
+# Clear all dup/escalation state when user starts a fresh search
+if search_clicked:
+    for _k in ["_dup_pending", "_dup_confirmed", "_dup_info", "_dup_existing_pdf_bytes",
+                "_escalation_mode", "_escalation_result", "_escalation_pdf_bytes",
+                "_esc_dup_pending", "_esc_dup_confirmed", "_esc_dup_info", "_esc_dup_pdf_bytes"]:
+        st.session_state.pop(_k, None)
+
+# ── Duplicate search warning / Escalation fork ───────────────────────────
 if st.session_state.get("_dup_pending") and not st.session_state.get("_dup_confirmed"):
     _info = st.session_state.get("_dup_info", {})
-    st.warning(
-        f"⚠️ An ROV was already generated for this address on **{_info.get('when', 'recently')}** "
-        f"by **{_info.get('who', 'a user')}** ({_info.get('count', 0)} comps used). "
-        f"Are you sure you want to search again?"
-    )
-    _, _dup_c1, _dup_c2, _ = st.columns([2, 1, 1, 2])
-    with _dup_c1:
-        if st.button("Yes, search again", key="_dup_yes", use_container_width=True):
-            st.session_state["_dup_confirmed"] = True
-            st.session_state.pop("_dup_pending", None)
-            st.rerun()
-    with _dup_c2:
-        _stored_json = _info.get("agent_json")
-        if _stored_json:
-            # Rebuild the PDF from the stored agent JSON
-            import tempfile
-            from pdf_builder import build_rov_pdf
+
+    if not st.session_state.get("_escalation_mode"):
+        # ── Three-option prompt ───────────────────────────────────────────
+        st.warning(
+            f"⚠️ An ROV was already generated for this address on **{_info.get('when', 'recently')}** "
+            f"by **{_info.get('who', 'a user')}** ({_info.get('count', 0)} comps used). "
+            f"How would you like to proceed?"
+        )
+
+        # Build the existing ROV PDF once for the direct download button
+        if "_dup_existing_pdf_bytes" not in st.session_state:
+            _stored_json_dl = _info.get("agent_json") or {}
             try:
-                with tempfile.TemporaryDirectory() as _tmpdir:
-                    import os
-                    _rov_path = os.path.join(_tmpdir, "filled_rov.pdf")
-                    build_rov_pdf("Main_ROV_blank.pdf", _stored_json, _rov_path)
-                    with open(_rov_path, "rb") as _f:
-                        _rov_bytes = _f.read()
-                _addr_label = _info.get("address", "property").replace(" ", "_")
+                from pdf_builder import build_rov_pdf as _build_rov_pdf
+                with tempfile.TemporaryDirectory() as _dup_tmp:
+                    _dup_out = os.path.join(_dup_tmp, "rov.pdf")
+                    _build_rov_pdf("Main_ROV_blank.pdf", _stored_json_dl, _dup_out)
+                    with open(_dup_out, "rb") as _dup_f:
+                        st.session_state["_dup_existing_pdf_bytes"] = _dup_f.read()
+            except Exception:
+                st.session_state["_dup_existing_pdf_bytes"] = b""
+
+        _dup_c1, _dup_c2, _dup_c3 = st.columns(3)
+        with _dup_c1:
+            _dup_dl_addr = st.session_state.get("subject_address", "").replace(" ", "_")
+            st.download_button(
+                label="Download Existing ROV",
+                data=st.session_state.get("_dup_existing_pdf_bytes", b""),
+                file_name=f"ROV_{_dup_dl_addr}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                type="primary",
+                key="_dup_download_existing",
+            )
+        with _dup_c2:
+            if st.button("Generate New ROV", key="_dup_yes", use_container_width=True, type="secondary"):
+                st.session_state["_dup_confirmed"] = True
+                st.session_state.pop("_dup_pending", None)
+                st.session_state.pop("_dup_existing_pdf_bytes", None)
+                st.rerun()
+        with _dup_c3:
+            if st.button("Fill Out Escalation Form", key="_esc_btn", use_container_width=True, type="secondary"):
+                _stored_json = _info.get("agent_json") or {}
+                _form_fields = _stored_json.get("form_fields", {}) if isinstance(_stored_json, dict) else {}
+                st.session_state["_escalation_mode"] = True
+                st.session_state["_escalation_address"] = _info.get("address", "")
+                st.session_state["_escalation_loan_number"] = _form_fields.get("loan_#", "")
+                st.session_state["_escalation_borrower_name"] = _form_fields.get("borrower", "")
+                st.session_state["_escalation_rov_json"] = _stored_json
+                st.session_state.pop("_escalation_result", None)
+                st.session_state.pop("_escalation_pdf_bytes", None)
+                st.session_state.pop("_esc_dup_pending", None)
+                st.session_state.pop("_esc_dup_confirmed", None)
+                st.session_state.pop("_dup_existing_pdf_bytes", None)
+                st.rerun()
+        st.stop()
+
+    else:
+        # ── Escalation Form UI ────────────────────────────────────────────
+        import tempfile
+
+        _esc_addr = st.session_state.get("_escalation_address", "")
+        _esc_loan = st.session_state.get("_escalation_loan_number", "")
+        _esc_borrower = st.session_state.get("_escalation_borrower_name", "")
+
+        st.markdown("### Appraisal Escalation")
+        st.info(
+            f"Generating an escalation for **{_esc_addr}**. "
+            "Upload the post-ROV appraisal PDF, then click Generate Escalation."
+        )
+
+        _col_back, _ = st.columns([1, 5])
+        with _col_back:
+            if st.button("← Back", key="_esc_back"):
+                for _k in ["_escalation_mode", "_escalation_result", "_escalation_pdf_bytes",
+                            "_esc_dup_pending", "_esc_dup_confirmed", "_esc_dup_info", "_esc_dup_pdf_bytes",
+                            "_dup_pending", "_dup_confirmed", "_dup_info", "_dup_existing_pdf_bytes"]:
+                    st.session_state.pop(_k, None)
+                st.rerun()
+
+        # ── Escalation duplicate check (runs immediately on form load) ───
+        if not st.session_state.get("_esc_dup_confirmed") and not st.session_state.get("_esc_dup_pending"):
+            try:
+                _esc_existing = find_recent_escalation(_esc_addr, days=60)
+            except Exception:
+                _esc_existing = None
+            if _esc_existing:
+                st.session_state["_esc_dup_pending"] = True
+                st.session_state["_esc_dup_info"] = _esc_existing
+
+        if st.session_state.get("_esc_dup_pending"):
+            _esc_dup_info = st.session_state.get("_esc_dup_info", {})
+            _esc_dup_when = _esc_dup_info.get("generated_at")
+            _esc_dup_when_str = _esc_dup_when.strftime("%b %d, %Y at %I:%M %p") if hasattr(_esc_dup_when, "strftime") else str(_esc_dup_when or "recently")
+            st.warning(
+                f"⚠️ An escalation was already generated for **{_esc_addr}** on **{_esc_dup_when_str}**. "
+                "Download the existing one or generate a new one."
+            )
+
+            # Build the existing PDF once so we can offer a direct download_button
+            if "_esc_dup_pdf_bytes" not in st.session_state:
+                _existing_res = _esc_dup_info.get("agent_json") or {}
+                try:
+                    import io as _io
+                    from reportlab.lib.pagesizes import LETTER  # already imported inside builder
+                    with tempfile.TemporaryDirectory() as _esc_tmp_dup:
+                        _esc_out_dup = os.path.join(_esc_tmp_dup, "escalation.pdf")
+                        escalation_pdf_builder.build_escalation_pdf(_existing_res, _esc_out_dup)
+                        with open(_esc_out_dup, "rb") as _ef_dup:
+                            st.session_state["_esc_dup_pdf_bytes"] = _ef_dup.read()
+                except Exception as _dup_pdf_err:
+                    st.error(f"Failed to load existing PDF: {_dup_pdf_err}")
+
+            _, _esc_dc1, _esc_dc2, _ = st.columns([2, 1, 1, 2])
+            with _esc_dc1:
+                _esc_dup_fname = f"Escalation_{_esc_addr.replace(' ', '_')}.pdf"
                 st.download_button(
-                    label="📄 Download ROV",
-                    data=_rov_bytes,
-                    file_name=f"ROV_{_addr_label}.pdf",
+                    label="Download Existing",
+                    data=st.session_state.get("_esc_dup_pdf_bytes", b""),
+                    file_name=_esc_dup_fname,
                     mime="application/pdf",
                     use_container_width=True,
-                    key="_dup_download",
+                    type="primary",
+                    key="_esc_dup_download",
                 )
-            except Exception:
-                st.button("📄 Download ROV", key="_dup_dl_err", use_container_width=True, disabled=True, help="Could not rebuild PDF from stored data.")
-        else:
-            st.button("📄 Download ROV", key="_dup_dl_na", use_container_width=True, disabled=True, help="No stored ROV data available.")
-    st.stop()
+            with _esc_dc2:
+                if st.button("Generate New One", key="_esc_dup_new", use_container_width=True, type="secondary"):
+                    st.session_state["_esc_dup_confirmed"] = True
+                    st.session_state.pop("_esc_dup_pending", None)
+                    st.session_state.pop("_esc_dup_pdf_bytes", None)
+                    st.rerun()
+            st.stop()
+
+        _esc_file = st.file_uploader(
+            "Upload Post-ROV Appraisal PDF",
+            type="pdf",
+            key="_esc_pdf_uploader",
+            help="The appraisal received after the ROV was submitted.",
+        )
+
+        _esc_selected_pages = None
+        if _esc_file is not None:
+            import fitz
+            import base64 as _b64
+
+            _esc_file_key = f"esc_pdf_thumbs_{_esc_file.name}_{_esc_file.size}"
+            if _esc_file_key != st.session_state.get("_esc_pdf_thumb_key"):
+                with st.spinner("Rendering PDF pages…"):
+                    _esc_doc = fitz.open(stream=_esc_file.getvalue(), filetype="pdf")
+                    _esc_thumbs = []
+                    for _epg in _esc_doc:
+                        _epix = _epg.get_pixmap(matrix=fitz.Matrix(0.5, 0.5), colorspace=fitz.csRGB, alpha=False)
+                        _esc_thumbs.append(_epix.tobytes("png"))
+                    _esc_doc.close()
+                for _k in list(st.session_state.keys()):
+                    if _k.startswith("_esc_pgchk_") or _k.startswith("_esc_pdf_hires_"):
+                        del st.session_state[_k]
+                st.session_state["_esc_pdf_thumb_key"] = _esc_file_key
+                st.session_state["_esc_pdf_thumbs"] = _esc_thumbs
+                st.session_state["_esc_pdf_raw_bytes"] = _esc_file.getvalue()
+                st.session_state["_esc_pdf_sel_pages"] = {1}
+
+            _esc_thumbs = st.session_state["_esc_pdf_thumbs"]
+            _esc_total_pages = len(_esc_thumbs)
+            _esc_current_sel = st.session_state.get("_esc_pdf_sel_pages", {1})
+
+            _esc_sel_count = len(_esc_current_sel)
+            _esc_sel_label = ", ".join(str(p) for p in sorted(_esc_current_sel)) if _esc_current_sel else "none"
+
+            st.markdown(
+                f"**📄 {_esc_total_pages} pages** — click a page to preview. "
+                f"<b>{_esc_sel_count} selected</b> ({_esc_sel_label})",
+                unsafe_allow_html=True,
+            )
+
+            st.markdown("""
+            <style>
+            .pdf-thumb { border-radius: 6px; border: 3px solid transparent; width: 100%; cursor: pointer; }
+            .pdf-thumb.selected { border-color: #4CAF50; }
+            </style>
+            """, unsafe_allow_html=True)
+
+            @st.dialog("Page Preview", width="large")
+            def _show_esc_page_preview(pg_num: int):
+                st.markdown(f"**Page {pg_num}**")
+                _hires_key = f"_esc_pdf_hires_{pg_num}"
+                if _hires_key not in st.session_state:
+                    _esc_hdoc = fitz.open(stream=st.session_state["_esc_pdf_raw_bytes"], filetype="pdf")
+                    _esc_hpg = _esc_hdoc[pg_num - 1]
+                    _esc_hpix = _esc_hpg.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), colorspace=fitz.csRGB, alpha=False)
+                    st.session_state[_hires_key] = _esc_hpix.tobytes("png")
+                    _esc_hdoc.close()
+                st.image(st.session_state[_hires_key], use_container_width=True)
+
+            _ESC_COLS = 5
+            with st.container(height=600):
+                for _row_start in range(0, _esc_total_pages, _ESC_COLS):
+                    _row_end = min(_row_start + _ESC_COLS, _esc_total_pages)
+                    _cols = st.columns(_ESC_COLS)
+                    for _ci, _pg_idx in enumerate(range(_row_start, _row_end)):
+                        _pg_num = _pg_idx + 1
+                        _is_sel = _pg_num in _esc_current_sel
+                        with _cols[_ci]:
+                            if st.button(
+                                f"Page {_pg_num}",
+                                key=f"_esc_pgview_{_pg_num}",
+                                use_container_width=True,
+                                type="tertiary",
+                            ):
+                                _show_esc_page_preview(_pg_num)
+                            _img_b64 = _b64.b64encode(_esc_thumbs[_pg_idx]).decode()
+                            _sel_class = "selected" if _is_sel else ""
+                            st.markdown(
+                                f'<img class="pdf-thumb {_sel_class}" '
+                                f'src="data:image/png;base64,{_img_b64}" />',
+                                unsafe_allow_html=True,
+                            )
+                            _checked = st.checkbox(
+                                "Include",
+                                value=_is_sel,
+                                key=f"_esc_pgchk_{_pg_num}",
+                            )
+                            if _checked:
+                                _esc_current_sel.add(_pg_num)
+                            else:
+                                _esc_current_sel.discard(_pg_num)
+
+            st.session_state["_esc_pdf_sel_pages"] = _esc_current_sel
+            _esc_selected_pages = sorted(_esc_current_sel) if _esc_current_sel else None
+
+            if not _esc_selected_pages:
+                st.warning("Please select at least one page.")
+
+        # Seed defaults once so user edits persist across reruns
+        st.session_state.setdefault("_esc_ln_input", _esc_loan)
+        st.session_state.setdefault("_esc_addr_input", _esc_addr)
+        st.session_state.setdefault("_esc_bn_input", _esc_borrower)
+
+        _ec1, _ec2 = st.columns(2)
+        with _ec1:
+            _esc_loan = st.text_input("Loan Number", key="_esc_ln_input")
+            _esc_addr = st.text_input("Address", key="_esc_addr_input")
+        with _ec2:
+            _esc_borrower = st.text_input("Borrower Name", key="_esc_bn_input")
+
+        _esc_generate = st.button(
+            "Generate Escalation",
+            type="primary",
+            use_container_width=True,
+            disabled=not (_esc_file is not None and _esc_selected_pages),
+            key="_esc_generate_btn",
+        )
+
+        if _esc_generate and _esc_file is not None and _esc_selected_pages:
+            # Clear any prior run before starting a new one
+            st.session_state.pop("_escalation_result", None)
+            st.session_state.pop("_escalation_pdf_bytes", None)
+
+            from pypdf import PdfReader as _EscPdfR, PdfWriter as _EscPdfW
+            import io as _esc_io
+            _esc_src = _EscPdfR(_esc_io.BytesIO(_esc_file.getvalue()))
+            _esc_writer = _EscPdfW()
+            for _epn in _esc_selected_pages:
+                _esc_writer.add_page(_esc_src.pages[_epn - 1])
+            _esc_buf = _esc_io.BytesIO()
+            _esc_writer.write(_esc_buf)
+            _esc_pdf_bytes = _esc_buf.getvalue()
+
+            _esc_input_payload = {
+                "address": _esc_addr,
+                "loan_number": _esc_loan,
+                "borrower_name": _esc_borrower,
+                "pdf_filename": _esc_file.name,
+                "pages_sent": _esc_selected_pages,
+                "rov_agent_json": st.session_state.get("_escalation_rov_json"),
+            }
+            st.session_state["_escalation_input_payload"] = _esc_input_payload
+
+            with st.spinner("Analyzing appraisal and building escalation form… This may take a minute."):
+                try:
+                    _esc_result = escalation_agent.run_escalation_agent(
+                        pdf_bytes=_esc_pdf_bytes,
+                        loan_number=_esc_loan,
+                        borrower_name=_esc_borrower,
+                        property_address=_esc_addr,
+                        rov_agent_json=st.session_state.get("_escalation_rov_json"),
+                        api_key=os.getenv("ANTHROPIC_API_KEY"),
+                    )
+                    st.session_state["_escalation_result"] = _esc_result
+                except Exception as _esc_err:
+                    st.error(f"Failed to analyze appraisal: {_esc_err}")
+                    with st.expander("Error details"):
+                        st.exception(_esc_err)
+
+        if "_escalation_result" in st.session_state:
+            _res = st.session_state["_escalation_result"]
+
+            if "_escalation_pdf_bytes" not in st.session_state:
+                with tempfile.TemporaryDirectory() as _esc_tmp:
+                    _esc_out = os.path.join(_esc_tmp, "escalation.pdf")
+                    try:
+                        _user_info = get_user()
+                        _res["input_coordinator"] = (_user_info or {}).get("name") or (_user_info or {}).get("username") or "N/A"
+                        escalation_pdf_builder.build_escalation_pdf(_res, _esc_out)
+                        with open(_esc_out, "rb") as _ef:
+                            st.session_state["_escalation_pdf_bytes"] = _ef.read()
+                        try:
+                            log_escalation(
+                                address=_esc_addr,
+                                loan_number=_esc_loan,
+                                borrower_name=_esc_borrower,
+                                agent_json=_res,
+                                input_payload=st.session_state.get("_escalation_input_payload"),
+                            )
+                        except Exception:
+                            pass
+                    except Exception as _pdf_err:
+                        st.error(f"Failed to generate PDF: {_pdf_err}")
+                        with st.expander("Error details"):
+                            st.exception(_pdf_err)
+
+        if "_escalation_pdf_bytes" in st.session_state:
+            _esc_fname = f"Escalation_{_esc_addr.replace(' ', '_')}.pdf"
+            st.download_button(
+                label="📄 Download Escalation PDF",
+                data=st.session_state["_escalation_pdf_bytes"],
+                file_name=_esc_fname,
+                mime="application/pdf",
+                use_container_width=True,
+                type="primary",
+                key="_esc_download",
+            )
+
+        st.stop()
 
 # ── Main logic ────────────────────────────────────────────────────────────
 
@@ -348,7 +654,7 @@ if search_clicked or st.session_state.get("_dup_confirmed") or _reload_clicked:
     if not _reload_clicked:
         _search_addr = street_address
         try:
-            _recent = find_recent_search(_search_addr, days=7)
+            _recent = find_recent_search(_search_addr, days=60)
         except Exception:
             _recent = None  # don't block on DB issues
 
@@ -490,6 +796,11 @@ if "_manual_comps" not in st.session_state:
 
 # Google Places autocomplete for manual comp lookup (same UX as main search)
 if use_autocomplete:
+    # Reset the form if a comp was just added (must happen before widget renders)
+    if st.session_state.pop("_mc_form_reset", False):
+        st.session_state["_mc_addr_query"] = ""
+        st.session_state.pop("_mc_addr_select", None)
+
     _mc_query = st.text_input("Start typing an address…", key="_mc_addr_query", placeholder="e.g. 456 Oak Ave, Springfield", on_change=lambda: None)
     # Prevent enter from triggering — only process when a dropdown selection is made
     _mc_suggestions = google_autocomplete(_mc_query) if _mc_query and len(_mc_query) >= 3 else []
@@ -524,8 +835,12 @@ if use_autocomplete:
                     st.warning(f"Property not found: {_manual_addr}, {_manual_zip}")
                 else:
                     st.session_state["_manual_comps"].append(_found.iloc[0].to_dict())
+                    st.session_state["_mc_form_reset"] = True
                     st.rerun()
 else:
+    if st.session_state.pop("_mc_form_reset", False):
+        st.session_state["_manual_comp_addr"] = ""
+        st.session_state["_manual_comp_zip"] = ""
     _mc1, _mc2, _mc3 = st.columns([3, 2, 1])
     with _mc1:
         _manual_addr = st.text_input("Address", placeholder="e.g. 456 Oak Ave", key="_manual_comp_addr")
@@ -557,6 +872,7 @@ else:
                 st.info("This property is already in the results.")
             else:
                 st.session_state["_manual_comps"].append(_row.to_dict())
+                st.session_state["_mc_form_reset"] = True
                 st.rerun()
 
 # Merge manual comps into the main comps dataframe
